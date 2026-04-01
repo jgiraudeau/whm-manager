@@ -63,7 +63,7 @@ export default function AccountDetailPage() {
     const [cloneSubdomain, setCloneSubdomain] = useState("");
     const [cloneLoading, setCloneLoading] = useState(false);
     const [cloneStep, setCloneStep] = useState(0); // 0: idle, 1: preparation, 2: cloning, 3: finishing
-    const [cloneMsg, setCloneMsg] = useState<{ type: "success" | "error"; text: string } | null>(null);
+    const [cloneMsg, setCloneMsg] = useState<{ type: "success" | "error" | "info"; text: string } | null>(null);
     const [installations, setInstallations] = useState<SoftInstall[]>([]);
     const [installationsLoading, setInstallationsLoading] = useState(false);
 
@@ -245,7 +245,17 @@ export default function AccountDetailPage() {
             setCloneStep(3); // Finishing
             await new Promise(r => setTimeout(r, 2000)); // Mimic propagation
 
-            setCloneMsg({ type: "success", text: `Site cloné vers ${cloneSubdomain}.${account?.domain}` });
+            if (data.pending) {
+                setCloneMsg({
+                    type: "info",
+                    text: data.message || `Clonage lancé vers ${cloneSubdomain}.${account?.domain}. Vérifiez dans 1 à 2 minutes.`,
+                });
+            } else {
+                setCloneMsg({
+                    type: "success",
+                    text: data.message || `Site cloné vers ${cloneSubdomain}.${account?.domain}`,
+                });
+            }
         } catch (e: unknown) {
             const err = e as Error;
             setCloneMsg({ type: "error", text: err.message });
@@ -581,8 +591,8 @@ export default function AccountDetailPage() {
                     </div>
                 </div>
                 {cloneMsg && (
-                    <div className={`flex items-center gap-2 mt-4 px-3 py-2 rounded-lg text-xs font-medium animate-in fade-in duration-300 ${cloneMsg.type === "success" ? "bg-green-500/10 text-green-400" : "bg-red-500/10 text-red-400"}`}>
-                        {cloneMsg.type === "success" ? <CheckCircle className="w-3 h-3" /> : <AlertTriangle className="w-3 h-3" />}
+                    <div className={`flex items-center gap-2 mt-4 px-3 py-2 rounded-lg text-xs font-medium animate-in fade-in duration-300 ${cloneMsg.type === "success" ? "bg-green-500/10 text-green-400" : cloneMsg.type === "info" ? "bg-blue-500/10 text-blue-300" : "bg-red-500/10 text-red-400"}`}>
+                        {cloneMsg.type === "success" ? <CheckCircle className="w-3 h-3" /> : cloneMsg.type === "info" ? <Loader2 className="w-3 h-3 animate-spin" /> : <AlertTriangle className="w-3 h-3" />}
                         {cloneMsg.text}
                     </div>
                 )}

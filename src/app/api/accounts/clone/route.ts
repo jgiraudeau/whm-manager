@@ -165,7 +165,6 @@ export async function POST(req: NextRequest) {
 
         let lastSoftError: string | null = null;
         let lastHttpStatus: number | null = null;
-        let cloneAccepted = false;
 
         for (const endpoint of cloneEndpoints) {
             const cloneRes = await fetch(endpoint, {
@@ -205,24 +204,29 @@ export async function POST(req: NextRequest) {
             }
 
             if (hasSuccessMarkers(cloneText, cloneData)) {
+                const completed =
+                    cloneText.includes("Clone Complete") ||
+                    cloneText.includes("successfully cloned") ||
+                    cloneData?.done === true;
+                const pending = !completed || Boolean(taskId);
+
                 return NextResponse.json({
                     success: true,
-                    message: doneMessage ?? `Site en cours de clonage vers ${targetUrl}`,
+                    message: doneMessage ?? (pending ? `Clonage lancé vers ${targetUrl}` : `Site cloné vers ${targetUrl}`),
                     targetUrl: `https://${targetUrl}`,
                     taskId,
+                    pending,
                 });
             }
-
-            cloneAccepted = true;
         }
 
         // Softaculous may queue clone tasks without explicit confirmation in response body.
         // Confirm by checking if target installation appears.
         const existsNow = await targetInstallationExists(baseUrl, cookie, targetUrl);
-        if (existsNow || cloneAccepted) {
+        if (existsNow) {
             return NextResponse.json({
                 success: true,
-                message: `Clonage lancé vers ${targetUrl}. Vérifiez l'état dans 1 à 2 minutes.`,
+                message: `Installation cible détectée pour ${targetUrl}. Le clonage peut encore être en cours.`,
                 targetUrl: `https://${targetUrl}`,
                 taskId: null,
                 pending: true,
@@ -236,7 +240,7 @@ export async function POST(req: NextRequest) {
         throw new Error(
             lastHttpStatus
                 ? `Softaculous clone HTTP ${lastHttpStatus} (insid/source/url à vérifier)`
-                : "Softaculous n'a pas confirmé le clonage (insid/source/url à vérifier)"
+                : "Softaculous n'a pas confirmé le clonage et aucune nouvelle installation cible n'a été détectée"
         );
     } catch (error: unknown) {
         return NextResponse.json({ error: safeError(error, "Erreur lors du clonage") }, { status: 500 });
