@@ -169,7 +169,7 @@ export async function POST(req: NextRequest) {
       success: true,
       mode: "prepared",
       message:
-        "Plan de migration inter-compte préparé. La copie/restauration automatique sera branchée en phase 2.",
+        "Plan de migration inter-compte préparé. Tu peux maintenant lancer la phase 2 depuis le bloc « Dernier plan préparé ».",
       plan,
     });
   } catch (error: unknown) {

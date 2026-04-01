@@ -286,9 +286,9 @@ export default function AdminMigrationsPage() {
         </Link>
         <div className="flex items-center justify-between gap-3">
           <div>
-            <h1 className="text-2xl font-bold text-white">Migration inter-compte (préparation)</h1>
+            <h1 className="text-2xl font-bold text-white">Migration inter-compte</h1>
             <p className="text-gray-500 text-sm mt-1">
-              Valide les prérequis source/cible et crée un plan de migration prêt pour la phase de copie.
+              Phase 1: préparation du plan. Phase 2: exécution (backup puis restauration).
             </p>
           </div>
           <button
@@ -316,6 +316,12 @@ export default function AdminMigrationsPage() {
           <p className="text-sm">{message}</p>
         </div>
       )}
+
+      <div className="p-4 rounded-xl border bg-blue-900/10 border-blue-800/40 text-blue-200 text-sm">
+        Après « Préparer la migration », utilise le bouton « Lancer phase 2 » dans « Dernier plan préparé ».
+        Si le statut passe à <span className="font-semibold">blocked</span> avec <span className="font-semibold">off_backup_restore</span>,
+        l&apos;hébergeur doit activer Backup/Restore dans Softaculous.
+      </div>
 
       <div className="grid lg:grid-cols-[1fr,1fr] gap-6">
         <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
