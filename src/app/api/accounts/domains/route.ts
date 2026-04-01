@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { cpanelApi } from "@/lib/whm";
-import { requireAuth, safeError } from "@/lib/auth";
+import { ensureAccountAccess, requireAuthSession, safeError } from "@/lib/auth";
 import { isValidCpanelUsername } from "@/lib/validators";
 
 type UnknownRecord = Record<string, unknown>;
@@ -30,7 +30,7 @@ function parseDomainList(value: unknown): string[] {
 }
 
 export async function GET(req: NextRequest) {
-    const denied = await requireAuth(req);
+    const { denied, session } = await requireAuthSession(req);
     if (denied) return denied;
 
     try {
@@ -40,6 +40,8 @@ export async function GET(req: NextRequest) {
         if (!user || !isValidCpanelUsername(user)) {
             return NextResponse.json({ error: "Utilisateur manquant ou invalide" }, { status: 400 });
         }
+        const forbidden = ensureAccountAccess(session, user);
+        if (forbidden) return forbidden;
 
         const data = await cpanelApi(user, "DomainInfo", "domains_data");
         const dataRecord = asRecord(data);
@@ -60,7 +62,13 @@ export async function GET(req: NextRequest) {
 
         const allDomains = [mainDomain, ...subDomains, ...addonDomains, ...parkedDomains].filter(Boolean);
 
-        return NextResponse.json({ domains: allDomains });
+        return NextResponse.json({
+            domains: allDomains,
+            mainDomain: mainDomain ?? "",
+            subDomains,
+            addonDomains,
+            parkedDomains,
+        });
     } catch (error: unknown) {
         return NextResponse.json({ error: safeError(error, "Erreur lors de la récupération des domaines") }, { status: 500 });
     }

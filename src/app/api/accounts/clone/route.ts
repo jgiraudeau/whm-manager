@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCPanelSessionData } from "@/lib/whm";
-import { requireAuth, safeError } from "@/lib/auth";
+import { ensureAccountAccess, requireAuthSession, safeError } from "@/lib/auth";
 import { isValidCpanelUsername } from "@/lib/validators";
 import {
     extractSoftaculousError,
@@ -129,7 +129,7 @@ async function targetInstallationExists(baseUrl: string, cookie: string, targetU
 }
 
 export async function POST(req: NextRequest) {
-    const denied = await requireAuth(req);
+    const { denied, session } = await requireAuthSession(req);
     if (denied) return denied;
 
     try {
@@ -142,6 +142,8 @@ export async function POST(req: NextRequest) {
         if (!isValidCpanelUsername(user)) {
             return NextResponse.json({ error: "Username invalide" }, { status: 400 });
         }
+        const forbidden = ensureAccountAccess(session, user);
+        if (forbidden) return forbidden;
         if (!SUBDOMAIN_RE.test(targetSubdomain)) {
             return NextResponse.json({ error: "Sous-domaine cible invalide" }, { status: 400 });
         }

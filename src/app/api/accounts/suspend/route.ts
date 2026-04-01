@@ -1,12 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import { suspendAccount, unsuspendAccount, deleteAccount } from "@/lib/whm";
-import { requireAuth, safeError } from "@/lib/auth";
+import { ensureAccountAccess, ensureSuperAdmin, requireAuthSession, safeError } from "@/lib/auth";
 import { isValidCpanelUsername } from "@/lib/validators";
 
 const VALID_ACTIONS = ["suspend", "unsuspend", "delete"] as const;
 
 export async function POST(req: NextRequest) {
-    const denied = await requireAuth(req);
+    const { denied, session } = await requireAuthSession(req);
     if (denied) return denied;
 
     try {
@@ -20,6 +20,12 @@ export async function POST(req: NextRequest) {
         }
         if (!VALID_ACTIONS.includes(action)) {
             return NextResponse.json({ error: "Action invalide" }, { status: 400 });
+        }
+        const forbidden = ensureAccountAccess(session, user);
+        if (forbidden) return forbidden;
+        if (action === "delete") {
+            const adminOnly = ensureSuperAdmin(session);
+            if (adminOnly) return adminOnly;
         }
 
         let result;

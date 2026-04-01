@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { SESSION_COOKIE_NAME } from "@/lib/auth";
+
+const SESSION_COOKIE_NAME = "whm_session";
 
 function isPublicPath(pathname: string): boolean {
   return pathname === "/login" || pathname.startsWith("/api/auth/");

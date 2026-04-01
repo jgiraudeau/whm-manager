@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getAutoSSLStatus, getAutoSSLLogs } from "@/lib/whm";
-import { requireAuth, safeError } from "@/lib/auth";
+import { ensureAccountAccess, requireAuthSession, safeError } from "@/lib/auth";
 import { isValidCpanelUsername } from "@/lib/validators";
 
 export async function GET(req: NextRequest) {
-    const denied = await requireAuth(req);
+    const { denied, session } = await requireAuthSession(req);
     if (denied) return denied;
 
     try {
@@ -14,6 +14,8 @@ export async function GET(req: NextRequest) {
         if (!user || !isValidCpanelUsername(user)) {
             return NextResponse.json({ error: "Utilisateur manquant ou invalide" }, { status: 400 });
         }
+        const forbidden = ensureAccountAccess(session, user);
+        if (forbidden) return forbidden;
 
         const [statusData, logsData] = await Promise.all([
             getAutoSSLStatus(user),

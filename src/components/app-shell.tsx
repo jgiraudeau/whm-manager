@@ -1,19 +1,38 @@
 "use client";
 
-import { ReactNode, useState } from "react";
+import { ReactNode, useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { LayoutDashboard, LogOut, PlusCircle, Server } from "lucide-react";
+import { LayoutDashboard, LogOut, PlusCircle, Server, ShieldCheck } from "lucide-react";
 
 interface AppShellProps {
   children: ReactNode;
+}
+
+interface SessionUser {
+  username: string;
+  role: "superadmin" | "operator";
+  source: "env" | "managed";
 }
 
 export default function AppShell({ children }: AppShellProps) {
   const pathname = usePathname();
   const router = useRouter();
   const [loggingOut, setLoggingOut] = useState(false);
+  const [sessionUser, setSessionUser] = useState<SessionUser | null>(null);
   const isLoginPage = pathname === "/login";
+
+  useEffect(() => {
+    if (isLoginPage) return;
+    fetch("/api/auth/me")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data?.user) setSessionUser(data.user as SessionUser);
+      })
+      .catch(() => {
+        // ignore
+      });
+  }, [isLoginPage]);
 
   async function logout() {
     setLoggingOut(true);
@@ -57,16 +76,33 @@ export default function AppShell({ children }: AppShellProps) {
             <LayoutDashboard className="w-4 h-4" />
             Dashboard
           </Link>
-          <Link
-            href="/accounts/new"
-            className="flex items-center gap-3 px-4 py-2.5 rounded-lg text-gray-400 hover:text-white hover:bg-gray-800 transition-all text-sm font-medium"
-          >
-            <PlusCircle className="w-4 h-4" />
-            Nouveau compte
-          </Link>
+          {sessionUser?.role === "superadmin" && (
+            <Link
+              href="/accounts/new"
+              className="flex items-center gap-3 px-4 py-2.5 rounded-lg text-gray-400 hover:text-white hover:bg-gray-800 transition-all text-sm font-medium"
+            >
+              <PlusCircle className="w-4 h-4" />
+              Nouveau compte
+            </Link>
+          )}
+          {sessionUser?.role === "superadmin" && (
+            <Link
+              href="/admin/access"
+              className="flex items-center gap-3 px-4 py-2.5 rounded-lg text-gray-400 hover:text-white hover:bg-gray-800 transition-all text-sm font-medium"
+            >
+              <ShieldCheck className="w-4 h-4" />
+              Droits d&apos;accès
+            </Link>
+          )}
         </nav>
 
         <div className="p-4 border-t border-gray-800">
+          {sessionUser && (
+            <div className="mb-3 px-3 py-2 rounded-lg bg-gray-800 border border-gray-700 text-xs">
+              <p className="text-gray-400">Connecté: <span className="text-gray-200 font-semibold">{sessionUser.username}</span></p>
+              <p className="text-gray-500 capitalize">Rôle: {sessionUser.role}</p>
+            </div>
+          )}
           <button
             onClick={logout}
             disabled={loggingOut}

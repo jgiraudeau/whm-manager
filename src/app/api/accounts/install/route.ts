@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCPanelSessionData } from "@/lib/whm";
-import { requireAuth, safeError } from "@/lib/auth";
+import { ensureAccountAccess, requireAuthSession, safeError } from "@/lib/auth";
 import { isValidCpanelUsername } from "@/lib/validators";
 
 const SOFTACULOUS_APPS: Record<string, { id: number; name: string }> = {
@@ -18,7 +18,7 @@ function generateSecurePassword(): string {
 }
 
 export async function POST(req: NextRequest) {
-    const denied = await requireAuth(req);
+    const { denied, session } = await requireAuthSession(req);
     if (denied) return denied;
 
     try {
@@ -30,6 +30,8 @@ export async function POST(req: NextRequest) {
         if (!isValidCpanelUsername(user)) {
             return NextResponse.json({ error: "Username invalide" }, { status: 400 });
         }
+        const forbidden = ensureAccountAccess(session, user);
+        if (forbidden) return forbidden;
         if (!DOMAIN_RE.test(targetDomain)) {
             return NextResponse.json({ error: "Domaine cible invalide" }, { status: 400 });
         }

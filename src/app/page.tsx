@@ -15,10 +15,16 @@ interface Account {
   startdate: string;
 }
 
+interface SessionUser {
+  username: string;
+  role: "superadmin" | "operator";
+}
+
 export default function Dashboard() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [sessionUser, setSessionUser] = useState<SessionUser | null>(null);
 
   const fetchAccounts = async () => {
     setLoading(true);
@@ -37,6 +43,17 @@ export default function Dashboard() {
   };
 
   useEffect(() => { fetchAccounts(); }, []);
+
+  useEffect(() => {
+    fetch("/api/auth/me")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (data?.user) setSessionUser(data.user as SessionUser);
+      })
+      .catch(() => {
+        // ignore
+      });
+  }, []);
 
   const suspended = accounts.filter(a => a.suspendreason !== "not suspended");
   const active = accounts.filter(a => a.suspendreason === "not suspended");
@@ -57,12 +74,14 @@ export default function Dashboard() {
             <RefreshCw className={`w-4 h-4 ${loading ? "animate-spin" : ""}`} />
             Actualiser
           </button>
-          <Link href="/accounts/new">
-            <button className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-bold transition-all shadow-lg shadow-blue-900/30">
-              <PlusCircle className="w-4 h-4" />
-              Nouveau compte
-            </button>
-          </Link>
+          {sessionUser?.role === "superadmin" && (
+            <Link href="/accounts/new">
+              <button className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-sm font-bold transition-all shadow-lg shadow-blue-900/30">
+                <PlusCircle className="w-4 h-4" />
+                Nouveau compte
+              </button>
+            </Link>
+          )}
         </div>
       </div>
 

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { cpanelApi } from "@/lib/whm";
-import { requireAuth, safeError } from "@/lib/auth";
+import { ensureAccountAccess, requireAuthSession, safeError } from "@/lib/auth";
 import { isValidCpanelUsername } from "@/lib/validators";
 
 const SUBDOMAIN_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/i;
@@ -8,7 +8,7 @@ const DOMAIN_RE = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$/i;
 const RESERVED_SUBDOMAINS = ["www", "mail", "ftp", "admin", "cpanel", "webmail", "whm"];
 
 export async function POST(req: NextRequest) {
-    const denied = await requireAuth(req);
+    const { denied, session } = await requireAuthSession(req);
     if (denied) return denied;
 
     try {
@@ -20,6 +20,8 @@ export async function POST(req: NextRequest) {
         if (!isValidCpanelUsername(user)) {
             return NextResponse.json({ error: "Username invalide" }, { status: 400 });
         }
+        const forbidden = ensureAccountAccess(session, user);
+        if (forbidden) return forbidden;
         if (!SUBDOMAIN_RE.test(subdomain)) {
             return NextResponse.json({ error: "Format de sous-domaine invalide" }, { status: 400 });
         }

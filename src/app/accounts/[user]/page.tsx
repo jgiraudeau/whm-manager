@@ -25,8 +25,18 @@ interface Account {
 interface SoftInstall {
     id: string;
     name: string;
+    app?: "wordpress" | "prestashop" | "other";
     url: string;
     path: string;
+    ver?: string;
+}
+
+interface DomainSummary {
+    domains: string[];
+    mainDomain?: string;
+    subDomains?: string[];
+    addonDomains?: string[];
+    parkedDomains?: string[];
 }
 
 interface InstallResult {
@@ -54,17 +64,27 @@ function normalizeHost(input: string): string {
     }
 }
 
+function detectManagedApp(value: string): "wordpress" | "prestashop" | "other" {
+    const normalized = value.trim().toLowerCase();
+    if (normalized.includes("wordpress")) return "wordpress";
+    if (normalized.includes("presta")) return "prestashop";
+    return "other";
+}
+
 export default function AccountDetailPage() {
     const { user } = useParams<{ user: string }>();
     const router = useRouter();
     const [account, setAccount] = useState<Account | null>(null);
     const [loading, setLoading] = useState(true);
+    const [sessionRole, setSessionRole] = useState<"superadmin" | "operator" | "">("");
     const [actionLoading, setActionLoading] = useState("");
     const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
     const [installResult, setInstallResult] = useState<InstallResult | null>(null);
     const [copiedKey, setCopiedKey] = useState("");
     const [installDomains, setInstallDomains] = useState<string[]>([]);
     const [selectedInstallDomain, setSelectedInstallDomain] = useState("");
+    const [domainSummary, setDomainSummary] = useState<DomainSummary | null>(null);
+    const [domainsLoading, setDomainsLoading] = useState(false);
 
     // AutoSSL state
     const [autoSSLStatus, setAutoSSLStatus] = useState<{ isRunning: boolean; lastLog: string; result: string } | null>(null);
@@ -99,13 +119,50 @@ export default function AccountDetailPage() {
         try {
             const res = await fetch(`/api/accounts/installations?user=${user}`);
             const data = await res.json();
-            const list = Array.isArray(data.installations) ? data.installations as SoftInstall[] : [];
+            const list = Array.isArray(data.installations)
+                ? (data.installations as SoftInstall[]).map((installation) => ({
+                    ...installation,
+                    app: installation.app ?? detectManagedApp(installation.name),
+                }))
+                : [];
             setInstallations(list);
             return list;
         } catch {
             return [];
         } finally {
             if (withLoader) setInstallationsLoading(false);
+        }
+    }, [user]);
+
+    const loadDomains = useCallback(async (withLoader = false): Promise<DomainSummary | null> => {
+        if (withLoader) setDomainsLoading(true);
+        try {
+            const res = await fetch(`/api/accounts/domains?user=${user}`);
+            const data = await res.json();
+            if (data.error) return null;
+            const summary: DomainSummary = {
+                domains: Array.isArray(data.domains) ? data.domains : [],
+                mainDomain: typeof data.mainDomain === "string" ? data.mainDomain : undefined,
+                subDomains: Array.isArray(data.subDomains) ? data.subDomains : [],
+                addonDomains: Array.isArray(data.addonDomains) ? data.addonDomains : [],
+                parkedDomains: Array.isArray(data.parkedDomains) ? data.parkedDomains : [],
+            };
+            setDomainSummary(summary);
+            if (summary.domains.length > 0) {
+                setInstallDomains(summary.domains);
+                setSelectedInstallDomain((prev) => {
+                    if (prev && summary.domains.includes(prev)) return prev;
+                    return summary.domains[0];
+                });
+            } else {
+                setInstallDomains([]);
+                setSelectedInstallDomain("");
+            }
+            return summary;
+        } catch {
+            return null;
+        } finally {
+            if (withLoader) setDomainsLoading(false);
         }
     }, [user]);
 
@@ -135,6 +192,18 @@ export default function AccountDetailPage() {
     }, [loadInstallations]);
 
     useEffect(() => {
+        fetch("/api/auth/me")
+            .then((res) => (res.ok ? res.json() : null))
+            .then((data) => {
+                const role = data?.user?.role;
+                if (role === "superadmin" || role === "operator") {
+                    setSessionRole(role);
+                }
+            })
+            .catch(() => {
+                // ignore
+            });
+
         setLoading(true);
         fetch("/api/accounts")
             .then(r => r.json())
@@ -144,23 +213,14 @@ export default function AccountDetailPage() {
                 setLoading(false);
             });
 
-        // Fetch domains for installation
-        fetch(`/api/accounts/domains?user=${user}`)
-            .then(r => r.json())
-            .then(data => {
-                if (data.domains?.length) {
-                    setInstallDomains(data.domains);
-                    setSelectedInstallDomain(data.domains[0]);
-                }
-            })
-            .catch(console.error);
+        // Fetch domains and installations
+        void loadDomains(true);
 
-        // Fetch installations for cloning
         void loadInstallations(true);
 
         // Initial AutoSSL status check
         fetchAutoSSLStatus();
-    }, [user, fetchAutoSSLStatus, loadInstallations]);
+    }, [user, fetchAutoSSLStatus, loadInstallations, loadDomains]);
 
     // Polling for AutoSSL
     useEffect(() => {
@@ -244,6 +304,7 @@ export default function AccountDetailPage() {
             const data = await res.json();
             if (data.error) throw new Error(data.error);
             setInstallResult(data);
+            await loadInstallations(false);
         } catch (e: unknown) {
             const err = e as Error;
             setMessage({ type: "error", text: err.message });
@@ -266,6 +327,7 @@ export default function AccountDetailPage() {
             if (data.error) throw new Error(data.error);
             setSubdomainMsg({ type: "success", text: `Sous-domaine créé : ${subdomainName}.${account?.domain}` });
             setSubdomainName("");
+            await loadDomains(false);
         } catch (e: unknown) {
             const err = e as Error;
             setSubdomainMsg({ type: "error", text: err.message });
@@ -345,6 +407,11 @@ export default function AccountDetailPage() {
     );
 
     const isSuspended = account.suspendreason !== "not suspended";
+    const subDomainList = (domainSummary?.subDomains ?? [])
+        .slice()
+        .sort((a, b) => a.localeCompare(b));
+    const wordpressInstallations = installations.filter((installation) => (installation.app ?? detectManagedApp(installation.name)) === "wordpress");
+    const prestashopInstallations = installations.filter((installation) => (installation.app ?? detectManagedApp(installation.name)) === "prestashop");
 
     // Disk usage calculation
     const diskUsedValue = parseFloat(account.diskused.replace(/[^\d.]/g, ""));
@@ -658,6 +725,99 @@ export default function AccountDetailPage() {
                 )}
             </div>
 
+            {/* Inventory */}
+            <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 shadow-sm">
+                <div className="flex items-start justify-between gap-3 mb-4">
+                    <div>
+                        <h2 className="font-semibold text-white">Tableau de bord du compte</h2>
+                        <p className="text-gray-500 text-xs mt-1">Sous-domaines et applications installées sur ce compte WHM.</p>
+                    </div>
+                    <button
+                        onClick={() => {
+                            void loadDomains(true);
+                            void loadInstallations(true);
+                        }}
+                        disabled={domainsLoading || installationsLoading}
+                        className="flex items-center gap-2 px-3 py-2 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg text-xs font-medium transition-all border border-gray-700 disabled:opacity-40"
+                    >
+                        <RefreshCw className={`w-3.5 h-3.5 ${(domainsLoading || installationsLoading) ? "animate-spin" : ""}`} />
+                        Actualiser
+                    </button>
+                </div>
+
+                <div className="grid md:grid-cols-3 gap-4 mb-4">
+                    <div className="bg-gray-800/40 border border-gray-800 rounded-lg p-4">
+                        <p className="text-xs text-gray-500 uppercase tracking-wider font-bold">Sous-domaines</p>
+                        <p className="text-2xl font-black text-white mt-2">{subDomainList.length}</p>
+                    </div>
+                    <div className="bg-gray-800/40 border border-gray-800 rounded-lg p-4">
+                        <p className="text-xs text-gray-500 uppercase tracking-wider font-bold">WordPress</p>
+                        <p className="text-2xl font-black text-blue-300 mt-2">{wordpressInstallations.length}</p>
+                    </div>
+                    <div className="bg-gray-800/40 border border-gray-800 rounded-lg p-4">
+                        <p className="text-xs text-gray-500 uppercase tracking-wider font-bold">PrestaShop</p>
+                        <p className="text-2xl font-black text-pink-300 mt-2">{prestashopInstallations.length}</p>
+                    </div>
+                </div>
+
+                <div className="grid lg:grid-cols-2 gap-4">
+                    <div className="bg-gray-800/30 border border-gray-800 rounded-lg p-4">
+                        <h3 className="text-sm font-semibold text-white mb-3">Liste des sous-domaines</h3>
+                        {domainsLoading ? (
+                            <p className="text-xs text-gray-500">Chargement…</p>
+                        ) : subDomainList.length === 0 ? (
+                            <p className="text-xs text-gray-500">Aucun sous-domaine détecté.</p>
+                        ) : (
+                            <div className="space-y-2 max-h-52 overflow-auto pr-1">
+                                {subDomainList.map((domain) => (
+                                    <div key={domain} className="flex items-center justify-between gap-3 bg-gray-900/60 border border-gray-800 rounded-lg px-3 py-2">
+                                        <span className="text-sm text-gray-200 truncate">{domain}</span>
+                                        <a href={`https://${domain}`} target="_blank" className="text-gray-500 hover:text-blue-400">
+                                            <ExternalLink className="w-3.5 h-3.5" />
+                                        </a>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+
+                    <div className="bg-gray-800/30 border border-gray-800 rounded-lg p-4">
+                        <h3 className="text-sm font-semibold text-white mb-3">Installations détectées</h3>
+                        {installationsLoading ? (
+                            <p className="text-xs text-gray-500">Chargement…</p>
+                        ) : installations.length === 0 ? (
+                            <p className="text-xs text-gray-500">Aucune installation Softaculous détectée.</p>
+                        ) : (
+                            <div className="space-y-2 max-h-52 overflow-auto pr-1">
+                                {installations.map((installation) => {
+                                    const appType = installation.app ?? detectManagedApp(installation.name);
+                                    const badgeClass =
+                                        appType === "wordpress"
+                                            ? "bg-blue-900/40 text-blue-300"
+                                            : appType === "prestashop"
+                                                ? "bg-pink-900/40 text-pink-300"
+                                                : "bg-gray-700/50 text-gray-300";
+
+                                    return (
+                                        <div key={installation.id} className="bg-gray-900/60 border border-gray-800 rounded-lg px-3 py-2">
+                                            <div className="flex items-center justify-between gap-2">
+                                                <div className="min-w-0">
+                                                    <p className="text-sm text-gray-200 truncate">{installation.url || installation.name}</p>
+                                                    <p className="text-[11px] text-gray-500 truncate">{installation.name}{installation.ver ? ` · v${installation.ver}` : ""}</p>
+                                                </div>
+                                                <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wide ${badgeClass}`}>
+                                                    {appType === "other" ? "autre" : appType}
+                                                </span>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
+
             {/* Admin Actions */}
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 shadow-sm">
                 <h2 className="font-semibold text-white mb-4">Actions administrateur</h2>
@@ -691,11 +851,13 @@ export default function AccountDetailPage() {
                         </button>
                     )}
 
-                    <button onClick={() => doAction("delete")} disabled={!!actionLoading}
-                        className="flex items-center gap-2 px-4 py-2.5 bg-red-900/40 hover:bg-red-800/60 disabled:opacity-40 text-red-400 border border-red-800/50 rounded-lg text-sm font-bold transition-all ml-auto">
-                        <Trash2 className="w-4 h-4" />
-                        {actionLoading === "delete" ? "Suppression..." : "Supprimer définitivement"}
-                    </button>
+                    {sessionRole === "superadmin" && (
+                        <button onClick={() => doAction("delete")} disabled={!!actionLoading}
+                            className="flex items-center gap-2 px-4 py-2.5 bg-red-900/40 hover:bg-red-800/60 disabled:opacity-40 text-red-400 border border-red-800/50 rounded-lg text-sm font-bold transition-all ml-auto">
+                            <Trash2 className="w-4 h-4" />
+                            {actionLoading === "delete" ? "Suppression..." : "Supprimer définitivement"}
+                        </button>
+                    )}
                 </div>
             </div>
         </div>

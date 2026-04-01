@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { ArrowLeft, User, Globe, Mail, KeyRound, CheckCircle, Copy, AlertCircle } from "lucide-react";
 
@@ -11,6 +11,8 @@ function generateUsername(firstName: string, lastName: string): string {
 }
 
 export default function NewAccountPage() {
+    const [canCreate, setCanCreate] = useState(false);
+    const [authLoading, setAuthLoading] = useState(true);
     const [form, setForm] = useState({ firstName: "", lastName: "", email: "", plan: "default" });
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState("");
@@ -18,6 +20,19 @@ export default function NewAccountPage() {
 
     const username = generateUsername(form.firstName, form.lastName);
     const domain = username ? `${username}.ltpsully.o2switch.site` : "";
+
+    useEffect(() => {
+        fetch("/api/auth/me")
+            .then(async (res) => {
+                if (!res.ok) return null;
+                return res.json();
+            })
+            .then((data) => {
+                const role = data?.user?.role;
+                setCanCreate(role === "superadmin");
+            })
+            .finally(() => setAuthLoading(false));
+    }, []);
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -43,6 +58,33 @@ export default function NewAccountPage() {
     const copyToClipboard = (text: string) => {
         navigator.clipboard.writeText(text);
     };
+
+    if (authLoading) {
+        return (
+            <div className="max-w-lg mx-auto">
+                <div className="bg-gray-900 border border-gray-800 rounded-2xl p-8 text-center text-sm text-gray-500">
+                    Vérification des droits…
+                </div>
+            </div>
+        );
+    }
+
+    if (!canCreate) {
+        return (
+            <div className="max-w-lg mx-auto">
+                <div className="bg-gray-900 border border-red-800/40 rounded-2xl p-8 text-center">
+                    <AlertCircle className="w-8 h-8 mx-auto text-red-400 mb-3" />
+                    <h2 className="text-lg font-bold text-white">Accès refusé</h2>
+                    <p className="text-sm text-gray-400 mt-2">La création de comptes est réservée aux superadministrateurs.</p>
+                    <Link href="/">
+                        <button className="mt-5 px-4 py-2.5 bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg text-sm border border-gray-700">
+                            Retour au dashboard
+                        </button>
+                    </Link>
+                </div>
+            </div>
+        );
+    }
 
     if (result) {
         return (

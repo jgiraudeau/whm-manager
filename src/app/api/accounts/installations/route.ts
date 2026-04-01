@@ -1,11 +1,18 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCPanelSessionData } from "@/lib/whm";
-import { requireAuth, safeError } from "@/lib/auth";
+import { ensureAccountAccess, requireAuthSession, safeError } from "@/lib/auth";
 import { isValidCpanelUsername } from "@/lib/validators";
 import { extractSoftaculousInstallations } from "@/lib/softaculous";
 
+function normalizeAppName(value: string): "wordpress" | "prestashop" | "other" {
+    const normalized = value.trim().toLowerCase();
+    if (normalized.includes("wordpress")) return "wordpress";
+    if (normalized.includes("prestashop")) return "prestashop";
+    return "other";
+}
+
 export async function GET(req: NextRequest) {
-    const denied = await requireAuth(req);
+    const { denied, session } = await requireAuthSession(req);
     if (denied) return denied;
 
     try {
@@ -15,6 +22,8 @@ export async function GET(req: NextRequest) {
         if (!user || !isValidCpanelUsername(user)) {
             return NextResponse.json({ error: "Utilisateur manquant ou invalide" }, { status: 400 });
         }
+        const forbidden = ensureAccountAccess(session, user);
+        if (forbidden) return forbidden;
 
         const { host, cpsess, cookie } = await getCPanelSessionData(user);
         const baseUrl = `https://${host}:2083/${cpsess}`;
@@ -31,13 +40,18 @@ export async function GET(req: NextRequest) {
             throw new Error("Réponse Softaculous invalide");
         });
 
-        const list = Object.entries(extractSoftaculousInstallations(data)).map(([id, installation]) => ({
-            id,
-            name: installation.script_name ?? installation.softname ?? "Application",
-            url: installation.softurl ?? installation.domain ?? "",
-            path: installation.softpath ?? "",
-            ver: installation.ver ?? "",
-        }));
+        const list = Object.entries(extractSoftaculousInstallations(data)).map(([id, installation]) => {
+            const appName = installation.script_name ?? installation.softname ?? "Application";
+            const app = normalizeAppName(appName);
+            return {
+                id,
+                name: appName,
+                app,
+                url: installation.softurl ?? installation.domain ?? "",
+                path: installation.softpath ?? "",
+                ver: installation.ver ?? "",
+            };
+        });
 
         return NextResponse.json({ installations: list });
     } catch (error: unknown) {

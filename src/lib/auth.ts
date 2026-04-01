@@ -1,3 +1,12 @@
+import { NextRequest, NextResponse } from "next/server";
+import {
+  authenticatePrincipal,
+  canAccessAccount,
+  isSuperAdmin,
+  resolvePrincipalByUsername,
+  type AccessPrincipal,
+} from "@/lib/access-control";
+
 const encoder = new TextEncoder();
 
 export const SESSION_COOKIE_NAME = "whm_session";
@@ -6,6 +15,16 @@ export const SESSION_TTL_SECONDS = 60 * 60 * 2; // 2 hours
 interface SessionPayload {
   u: string;
   exp: number;
+}
+
+export type AuthenticatedSession = AccessPrincipal;
+
+export interface AuthConfigStatus {
+  hasAdminUser: boolean;
+  hasAdminPassword: boolean;
+  hasAuthSecret: boolean;
+  adminUserSource: "ADMIN_USER" | "ADMIN_BASIC_USER" | null;
+  adminPasswordSource: "ADMIN_PASSWORD" | "ADMIN_BASIC_PASSWORD" | null;
 }
 
 function base64UrlEncode(bytes: Uint8Array): string {
@@ -42,6 +61,14 @@ function constantTimeEqual(a: string, b: string): boolean {
     result |= a.charCodeAt(i) ^ b.charCodeAt(i);
   }
   return result === 0;
+}
+
+function getExpectedAdminUser(): string | undefined {
+  return process.env.ADMIN_USER ?? process.env.ADMIN_BASIC_USER;
+}
+
+function getExpectedAdminPassword(): string | undefined {
+  return process.env.ADMIN_PASSWORD ?? process.env.ADMIN_BASIC_PASSWORD;
 }
 
 function getAuthSecret(): string {
@@ -106,20 +133,9 @@ export async function verifySessionToken(token: string): Promise<SessionPayload 
   return payload;
 }
 
-function getExpectedAdminUser(): string | undefined {
-  return process.env.ADMIN_USER ?? process.env.ADMIN_BASIC_USER;
-}
-
-function getExpectedAdminPassword(): string | undefined {
-  return process.env.ADMIN_PASSWORD ?? process.env.ADMIN_BASIC_PASSWORD;
-}
-
-export interface AuthConfigStatus {
-  hasAdminUser: boolean;
-  hasAdminPassword: boolean;
-  hasAuthSecret: boolean;
-  adminUserSource: "ADMIN_USER" | "ADMIN_BASIC_USER" | null;
-  adminPasswordSource: "ADMIN_PASSWORD" | "ADMIN_BASIC_PASSWORD" | null;
+export async function authenticateCredentials(user: string, password: string): Promise<AuthenticatedSession | null> {
+  const principal = await authenticatePrincipal(user, password);
+  return principal;
 }
 
 export function getAuthConfigStatus(): AuthConfigStatus {
@@ -153,15 +169,6 @@ export function authIsConfigured(): boolean {
   return status.hasAdminUser && status.hasAdminPassword && status.hasAuthSecret;
 }
 
-export function verifyAdminCredentials(user: string, password: string): boolean {
-  const expectedUser = getExpectedAdminUser();
-  const expectedPassword = getExpectedAdminPassword();
-
-  if (!expectedUser || !expectedPassword) return false;
-
-  return constantTimeEqual(user, expectedUser) && constantTimeEqual(password, expectedPassword);
-}
-
 export function getSessionCookieOptions() {
   return {
     httpOnly: true,
@@ -172,21 +179,65 @@ export function getSessionCookieOptions() {
   };
 }
 
-/**
- * Defense-in-depth auth check for API route handlers.
- * Returns null if authenticated, or a 401 NextResponse if not.
- */
-export async function requireAuth(req: import("next/server").NextRequest): Promise<import("next/server").NextResponse | null> {
-  const { NextResponse } = await import("next/server");
+async function readSessionFromRequest(req: NextRequest): Promise<AuthenticatedSession | null> {
   const token = req.cookies.get(SESSION_COOKIE_NAME)?.value;
-  if (!token) {
-    return NextResponse.json({ error: "Non autorisé" }, { status: 401 });
-  }
-  const session = await verifySessionToken(token);
+  if (!token) return null;
+
+  const payload = await verifySessionToken(token);
+  if (!payload?.u) return null;
+
+  const principal = await resolvePrincipalByUsername(payload.u);
+  if (!principal) return null;
+  return principal;
+}
+
+export async function getAuthSession(req: NextRequest): Promise<AuthenticatedSession | null> {
+  return readSessionFromRequest(req);
+}
+
+export async function requireAuth(req: NextRequest): Promise<NextResponse | null> {
+  const session = await readSessionFromRequest(req);
   if (!session) {
     return NextResponse.json({ error: "Session invalide ou expirée" }, { status: 401 });
   }
   return null;
+}
+
+export async function requireAuthSession(
+  req: NextRequest,
+): Promise<
+  | { denied: NextResponse; session: null }
+  | { denied: null; session: AuthenticatedSession }
+> {
+  const session = await readSessionFromRequest(req);
+  if (!session) {
+    return {
+      denied: NextResponse.json({ error: "Session invalide ou expirée" }, { status: 401 }),
+      session: null,
+    };
+  }
+  return { denied: null, session };
+}
+
+export function filterAccountsForSession<T extends { user: string }>(
+  session: AuthenticatedSession,
+  accounts: T[],
+): T[] {
+  if (session.role === "superadmin") return accounts;
+  return accounts.filter((account) => canAccessAccount(session, account.user));
+}
+
+export function ensureAccountAccess(
+  session: AuthenticatedSession,
+  cpanelUser: string,
+): NextResponse | null {
+  if (canAccessAccount(session, cpanelUser)) return null;
+  return NextResponse.json({ error: "Accès refusé pour ce compte" }, { status: 403 });
+}
+
+export function ensureSuperAdmin(session: AuthenticatedSession): NextResponse | null {
+  if (isSuperAdmin(session)) return null;
+  return NextResponse.json({ error: "Action réservée aux administrateurs" }, { status: 403 });
 }
 
 /**
