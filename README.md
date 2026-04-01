@@ -7,6 +7,7 @@ Application Next.js pour piloter des comptes WHM/cPanel (o2switch):
 - actions Softaculous (install/clone)
 - declenchement AutoSSL
 - gestion des droits d'acces par utilisateur (RBAC)
+- preparation de migrations inter-compte (source/cible + checks + plan)
 
 ## Prerequis
 
@@ -98,3 +99,8 @@ Configuration:
 - permissions par utilisateur:
   - `superadmin`: acces a tous les comptes + console des droits
   - `operator`: acces limite aux comptes explicitement autorises
+- migrations inter-compte:
+  - console superadmin: `/admin/migrations`
+  - endpoint de preparation: `POST /api/admin/migrations/cross-account/prepare`
+  - historique des plans: `GET /api/admin/migrations/cross-account`
+  - stockage local des plans: `MIGRATION_STORE_PATH` (sinon `data/migrations.json` hors Vercel, `/tmp` sur Vercel)
