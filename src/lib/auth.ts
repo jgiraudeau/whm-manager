@@ -114,8 +114,43 @@ function getExpectedAdminPassword(): string | undefined {
   return process.env.ADMIN_PASSWORD ?? process.env.ADMIN_BASIC_PASSWORD;
 }
 
+export interface AuthConfigStatus {
+  hasAdminUser: boolean;
+  hasAdminPassword: boolean;
+  hasAuthSecret: boolean;
+  adminUserSource: "ADMIN_USER" | "ADMIN_BASIC_USER" | null;
+  adminPasswordSource: "ADMIN_PASSWORD" | "ADMIN_BASIC_PASSWORD" | null;
+}
+
+export function getAuthConfigStatus(): AuthConfigStatus {
+  const hasAdminUser = Boolean(getExpectedAdminUser());
+  const hasAdminPassword = Boolean(getExpectedAdminPassword());
+  const hasAuthSecret = Boolean(process.env.AUTH_SECRET);
+
+  const adminUserSource = process.env.ADMIN_USER
+    ? "ADMIN_USER"
+    : process.env.ADMIN_BASIC_USER
+      ? "ADMIN_BASIC_USER"
+      : null;
+
+  const adminPasswordSource = process.env.ADMIN_PASSWORD
+    ? "ADMIN_PASSWORD"
+    : process.env.ADMIN_BASIC_PASSWORD
+      ? "ADMIN_BASIC_PASSWORD"
+      : null;
+
+  return {
+    hasAdminUser,
+    hasAdminPassword,
+    hasAuthSecret,
+    adminUserSource,
+    adminPasswordSource,
+  };
+}
+
 export function authIsConfigured(): boolean {
-  return Boolean(getExpectedAdminUser() && getExpectedAdminPassword() && process.env.AUTH_SECRET);
+  const status = getAuthConfigStatus();
+  return status.hasAdminUser && status.hasAdminPassword && status.hasAuthSecret;
 }
 
 export function verifyAdminCredentials(user: string, password: string): boolean {

@@ -3,6 +3,7 @@ import {
   SESSION_COOKIE_NAME,
   authIsConfigured,
   createSessionToken,
+  getAuthConfigStatus,
   getSessionCookieOptions,
   verifyAdminCredentials,
 } from "@/lib/auth";
@@ -19,8 +20,12 @@ function parseBody(input: unknown): LoginBody {
 
 export async function POST(req: NextRequest) {
   if (!authIsConfigured()) {
+    const status = getAuthConfigStatus();
     return NextResponse.json(
-      { error: "Authentication is not configured on the server." },
+      {
+        error: "Authentication is not configured on the server.",
+        configStatus: status,
+      },
       { status: 503 },
     );
   }
