@@ -2,6 +2,7 @@ import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { isValidCpanelUsername } from "@/lib/validators";
+import { resolveStorePath } from "@/lib/store-path";
 
 export type AccessRole = "superadmin" | "operator";
 
@@ -81,10 +82,11 @@ function getEnvAdminPassword(): string | undefined {
 }
 
 function getStorePath(): string {
-  const explicitPath = process.env.ACCESS_CONTROL_STORE_PATH?.trim();
-  if (explicitPath) return explicitPath;
-  if (process.env.VERCEL) return "/tmp/whm-manager-access-control.json";
-  return path.join(process.cwd(), "data", "access-control.json");
+  return resolveStorePath({
+    explicitEnvVar: "ACCESS_CONTROL_STORE_PATH",
+    vercelTmpFile: "whm-manager-access-control.json",
+    defaultFileName: "access-control.json",
+  });
 }
 
 function hashPassword(password: string): string {

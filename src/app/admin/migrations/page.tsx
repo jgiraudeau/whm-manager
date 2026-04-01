@@ -9,6 +9,7 @@ import {
   Loader2,
   RefreshCw,
   GitBranchPlus,
+  PlayCircle,
 } from "lucide-react";
 
 interface AccountItem {
@@ -25,7 +26,7 @@ interface InstallationItem {
 
 interface MigrationPlan {
   id: string;
-  status: "prepared";
+  status: "prepared" | "running" | "blocked" | "completed";
   createdAt: string;
   createdBy: string;
   sourceAccount: string;
@@ -39,6 +40,14 @@ interface MigrationPlan {
   createdTargetSubdomain: boolean;
   checks: string[];
   nextActions: string[];
+  execution?: {
+    startedAt?: string;
+    finishedAt?: string;
+    backupTriggered?: boolean;
+    backupMessage?: string;
+    blockerReason?: string;
+    logs?: string[];
+  };
 }
 
 interface SessionUser {
@@ -54,6 +63,7 @@ export default function AdminMigrationsPage() {
   const [loading, setLoading] = useState(true);
   const [installationsLoading, setInstallationsLoading] = useState(false);
   const [preparing, setPreparing] = useState(false);
+  const [executingId, setExecutingId] = useState("");
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [preparedPlan, setPreparedPlan] = useState<MigrationPlan | null>(null);
@@ -203,6 +213,46 @@ export default function AdminMigrationsPage() {
     } finally {
       setPreparing(false);
     }
+  }
+
+  async function executePlan(planId: string) {
+    setExecutingId(planId);
+    setError("");
+    setMessage("");
+    try {
+      const res = await fetch("/api/admin/migrations/cross-account/execute", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ planId }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        throw new Error(data.error ?? "Échec d'exécution du plan");
+      }
+
+      const plan = data.plan as MigrationPlan | undefined;
+      if (plan) {
+        setPreparedPlan(plan);
+      }
+
+      if (data.success === false || data.blocked) {
+        setError(data.message ?? "Le plan est bloqué");
+      } else {
+        setMessage(data.message ?? "Exécution lancée");
+      }
+      await refreshPlans();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Erreur d'exécution");
+    } finally {
+      setExecutingId("");
+    }
+  }
+
+  function statusBadge(status: MigrationPlan["status"]): string {
+    if (status === "completed") return "bg-green-900/40 text-green-300";
+    if (status === "running") return "bg-blue-900/40 text-blue-300";
+    if (status === "blocked") return "bg-red-900/40 text-red-300";
+    return "bg-gray-700/60 text-gray-300";
   }
 
   if (loading) {
@@ -386,6 +436,22 @@ export default function AdminMigrationsPage() {
                 <p className="text-gray-300">
                   <span className="text-gray-500">Cible:</span> {preparedPlan.destinationAccount} ({preparedPlan.targetUrl})
                 </p>
+                <p className="text-gray-300">
+                  <span className="text-gray-500">Statut:</span>{" "}
+                  <span className={`px-2 py-0.5 rounded-full text-xs font-semibold ${statusBadge(preparedPlan.status)}`}>
+                    {preparedPlan.status}
+                  </span>
+                </p>
+                {preparedPlan.execution?.backupMessage && (
+                  <p className="text-gray-300">
+                    <span className="text-gray-500">Backup:</span> {preparedPlan.execution.backupMessage}
+                  </p>
+                )}
+                {preparedPlan.execution?.blockerReason && (
+                  <p className="text-red-300">
+                    <span className="text-red-400">Blocage:</span> {preparedPlan.execution.blockerReason}
+                  </p>
+                )}
                 <div>
                   <p className="text-gray-500 mb-1">Vérifications</p>
                   <ul className="space-y-1">
@@ -402,6 +468,24 @@ export default function AdminMigrationsPage() {
                     ))}
                   </ul>
                 </div>
+                {preparedPlan.execution?.logs && preparedPlan.execution.logs.length > 0 && (
+                  <div>
+                    <p className="text-gray-500 mb-1">Journal d&apos;exécution</p>
+                    <div className="max-h-40 overflow-auto pr-1 space-y-1">
+                      {preparedPlan.execution.logs.slice(-8).map((log) => (
+                        <p key={log} className="text-xs text-gray-400">{log}</p>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                <button
+                  onClick={() => void executePlan(preparedPlan.id)}
+                  disabled={executingId === preparedPlan.id || preparedPlan.status === "running"}
+                  className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg text-sm font-semibold flex items-center justify-center gap-2"
+                >
+                  {executingId === preparedPlan.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <PlayCircle className="w-4 h-4" />}
+                  {executingId === preparedPlan.id ? "Exécution…" : "Lancer phase 2"}
+                </button>
               </div>
             )}
           </div>
@@ -414,9 +498,28 @@ export default function AdminMigrationsPage() {
               <div className="space-y-2 max-h-72 overflow-auto pr-1">
                 {plans.map((plan) => (
                   <div key={plan.id} className="bg-gray-800/40 border border-gray-700 rounded-lg px-3 py-2">
-                    <p className="text-xs text-gray-400">{new Date(plan.createdAt).toLocaleString("fr-FR")}</p>
-                    <p className="text-sm text-gray-100">{plan.sourceAccount} → {plan.destinationAccount}</p>
-                    <p className="text-xs text-gray-500">{plan.targetUrl}</p>
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="text-xs text-gray-400">{new Date(plan.createdAt).toLocaleString("fr-FR")}</p>
+                        <p className="text-sm text-gray-100">{plan.sourceAccount} → {plan.destinationAccount}</p>
+                        <p className="text-xs text-gray-500 truncate">{plan.targetUrl}</p>
+                        {plan.execution?.backupMessage && (
+                          <p className="text-[11px] text-gray-400 mt-1">{plan.execution.backupMessage}</p>
+                        )}
+                      </div>
+                      <div className="flex flex-col items-end gap-2">
+                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase ${statusBadge(plan.status)}`}>
+                          {plan.status}
+                        </span>
+                        <button
+                          onClick={() => void executePlan(plan.id)}
+                          disabled={executingId === plan.id || plan.status === "running"}
+                          className="px-2.5 py-1 rounded-md bg-indigo-600/90 hover:bg-indigo-500 disabled:opacity-40 text-white text-[11px] font-semibold"
+                        >
+                          {executingId === plan.id ? "Exécution…" : "Exécuter"}
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 ))}
               </div>

@@ -1,5 +1,6 @@
 import { getCPanelSessionData } from "@/lib/whm";
 import {
+  extractSoftaculousError,
   extractSoftaculousInstallations,
   normalizeHost,
   type SoftaculousInstallation,
@@ -103,4 +104,67 @@ export function resolveInstallationByRef(
     installations.find((installation) => installation.host.endsWith(`.${refHost}`) || refHost.endsWith(`.${installation.host}`)) ??
     null
   );
+}
+
+export interface SoftaculousBackupTriggerResult {
+  success: boolean;
+  message: string;
+  softError: string | null;
+  payload: Record<string, unknown> | null;
+}
+
+export async function triggerSoftaculousBackup(
+  user: string,
+  installationId: string,
+): Promise<SoftaculousBackupTriggerResult> {
+  if (!isValidCpanelUsername(user)) {
+    throw new Error("Utilisateur cPanel invalide");
+  }
+  if (!installationId.trim()) {
+    throw new Error("ID d'installation manquant");
+  }
+
+  const { host, cpsess, cookie } = await getCPanelSessionData(user);
+  const baseUrl = `https://${host}:2083/${cpsess}`;
+
+  const res = await fetch(
+    `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=backup&insid=${encodeURIComponent(
+      installationId,
+    )}&api=json`,
+    { headers: { Cookie: cookie } },
+  );
+  const text = await res.text();
+  const parsed = parseMaybeJson(text);
+  const softError = extractSoftaculousError(parsed);
+  const doneMessage =
+    typeof parsed?.done_msg === "string"
+      ? parsed.done_msg
+      : typeof parsed?.msg === "string"
+        ? parsed.msg
+        : "";
+
+  if (!res.ok) {
+    return {
+      success: false,
+      message: `Softaculous backup HTTP ${res.status}`,
+      softError,
+      payload: parsed,
+    };
+  }
+
+  if (softError) {
+    return {
+      success: false,
+      message: softError,
+      softError,
+      payload: parsed,
+    };
+  }
+
+  return {
+    success: true,
+    message: doneMessage || "Sauvegarde Softaculous déclenchée",
+    softError: null,
+    payload: parsed,
+  };
 }
