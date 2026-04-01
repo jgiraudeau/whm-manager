@@ -38,6 +38,22 @@ interface InstallResult {
     adminEmail: string;
 }
 
+function normalizeHost(input: string): string {
+    const raw = input.trim();
+    if (!raw) return "";
+
+    const withProtocol = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`;
+    try {
+        return new URL(withProtocol).hostname.toLowerCase().replace(/^www\./, "");
+    } catch {
+        return raw
+            .replace(/^https?:\/\//i, "")
+            .split("/")[0]
+            .toLowerCase()
+            .replace(/^www\./, "");
+    }
+}
+
 export default function AccountDetailPage() {
     const { user } = useParams<{ user: string }>();
     const router = useRouter();
@@ -64,6 +80,7 @@ export default function AccountDetailPage() {
     const [cloneLoading, setCloneLoading] = useState(false);
     const [cloneStep, setCloneStep] = useState(0); // 0: idle, 1: preparation, 2: cloning, 3: finishing
     const [cloneMsg, setCloneMsg] = useState<{ type: "success" | "error" | "info"; text: string } | null>(null);
+    const [cloneChecking, setCloneChecking] = useState(false);
     const [installations, setInstallations] = useState<SoftInstall[]>([]);
     const [installationsLoading, setInstallationsLoading] = useState(false);
 
@@ -76,6 +93,46 @@ export default function AccountDetailPage() {
             // Silently fail for polling
         }
     }, [user]);
+
+    const loadInstallations = useCallback(async (withLoader = false): Promise<SoftInstall[]> => {
+        if (withLoader) setInstallationsLoading(true);
+        try {
+            const res = await fetch(`/api/accounts/installations?user=${user}`);
+            const data = await res.json();
+            const list = Array.isArray(data.installations) ? data.installations as SoftInstall[] : [];
+            setInstallations(list);
+            return list;
+        } catch {
+            return [];
+        } finally {
+            if (withLoader) setInstallationsLoading(false);
+        }
+    }, [user]);
+
+    const monitorCloneCompletion = useCallback(async (targetHost: string) => {
+        const normalizedTarget = normalizeHost(targetHost);
+        if (!normalizedTarget) return;
+
+        setCloneChecking(true);
+        try {
+            for (let attempt = 1; attempt <= 12; attempt += 1) {
+                await new Promise((resolve) => setTimeout(resolve, 5000));
+                const latestInstallations = await loadInstallations(false);
+                const found = latestInstallations.some((install) => normalizeHost(install.url) === normalizedTarget);
+                if (found) {
+                    setCloneMsg({ type: "success", text: `Clonage terminé : ${targetHost}` });
+                    return;
+                }
+                setCloneMsg({ type: "info", text: `Clonage lancé en arrière-plan… vérification (${attempt}/12)` });
+            }
+            setCloneMsg({
+                type: "info",
+                text: `Clonage lancé en arrière-plan pour ${targetHost}. Vérifie dans 2 à 5 minutes puis rafraîchis.`,
+            });
+        } finally {
+            setCloneChecking(false);
+        }
+    }, [loadInstallations]);
 
     useEffect(() => {
         setLoading(true);
@@ -99,18 +156,11 @@ export default function AccountDetailPage() {
             .catch(console.error);
 
         // Fetch installations for cloning
-        setInstallationsLoading(true);
-        fetch(`/api/accounts/installations?user=${user}`)
-            .then(r => r.json())
-            .then(data => {
-                setInstallations(data.installations || []);
-                setInstallationsLoading(false);
-            })
-            .catch(() => setInstallationsLoading(false));
+        void loadInstallations(true);
 
         // Initial AutoSSL status check
         fetchAutoSSLStatus();
-    }, [user, fetchAutoSSLStatus]);
+    }, [user, fetchAutoSSLStatus, loadInstallations]);
 
     // Polling for AutoSSL
     useEffect(() => {
@@ -226,6 +276,9 @@ export default function AccountDetailPage() {
 
     const cloneSite = async () => {
         if (!cloneSourceUrl || !cloneSubdomain) return;
+        const accountDomain = account?.domain;
+        if (!accountDomain) return;
+
         setCloneLoading(true);
         setCloneMsg(null);
         setCloneStep(1); // Preparation
@@ -237,7 +290,7 @@ export default function AccountDetailPage() {
             const res = await fetch("/api/accounts/clone", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ user, sourceRef: cloneSourceUrl, targetSubdomain: cloneSubdomain, domain: account?.domain }),
+                body: JSON.stringify({ user, sourceRef: cloneSourceUrl, targetSubdomain: cloneSubdomain, domain: accountDomain }),
             });
             const data = await res.json();
             if (!res.ok || data.error || data.success === false) {
@@ -248,15 +301,20 @@ export default function AccountDetailPage() {
             await new Promise(r => setTimeout(r, 2000)); // Mimic propagation
 
             if (data.pending) {
+                const targetHost = `${cloneSubdomain}.${accountDomain}`;
                 setCloneMsg({
                     type: "info",
-                    text: data.message || `Clonage lancé vers ${cloneSubdomain}.${account?.domain}. Vérifiez dans 1 à 2 minutes.`,
+                    text: data.message || `Clonage lancé vers ${targetHost}. Vérification automatique en cours…`,
                 });
+                setCloneSubdomain("");
+                void monitorCloneCompletion(targetHost);
             } else {
                 setCloneMsg({
                     type: "success",
-                    text: data.message || `Site cloné vers ${cloneSubdomain}.${account?.domain}`,
+                    text: data.message || `Site cloné vers ${cloneSubdomain}.${accountDomain}`,
                 });
+                setCloneSubdomain("");
+                await loadInstallations(false);
             }
         } catch (e: unknown) {
             const err = e as Error;
@@ -584,11 +642,11 @@ export default function AccountDetailPage() {
                         </div>
                         <button
                             onClick={cloneSite}
-                            disabled={cloneLoading || !cloneSourceUrl || !cloneSubdomain}
+                            disabled={cloneLoading || cloneChecking || !cloneSourceUrl || !cloneSubdomain}
                             className="flex items-center gap-2 px-5 py-2.5 bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white rounded-lg text-sm font-bold transition-all shadow-lg shadow-purple-900/30"
                         >
-                            {cloneLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <CopyIcon className="w-4 h-4" />}
-                            Cloner
+                            {cloneLoading || cloneChecking ? <Loader2 className="w-4 h-4 animate-spin" /> : <CopyIcon className="w-4 h-4" />}
+                            {cloneChecking ? "Vérification..." : "Cloner"}
                         </button>
                     </div>
                 </div>

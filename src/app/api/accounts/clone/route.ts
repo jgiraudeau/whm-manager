@@ -335,7 +335,7 @@ export async function POST(req: NextRequest) {
     } catch (error: unknown) {
         return NextResponse.json(
             { success: false, error: safeError(error, "Erreur lors du clonage") },
-            { status: 400 },
+            { status: 200 },
         );
     }
 }
