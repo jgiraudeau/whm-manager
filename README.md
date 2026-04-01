@@ -1,36 +1,92 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# WHM Manager
 
-## Getting Started
+Application Next.js pour piloter des comptes WHM/cPanel (o2switch):
+- liste des comptes cPanel
+- creation/suspension
+- operations de domaines et sous-domaines
+- actions Softaculous (install/clone)
+- declenchement AutoSSL
 
-First, run the development server:
+## Prerequis
+
+- Node.js 20+
+- acces WHM API (host, user, token)
+- variables d'environnement configurees
+
+## Configuration locale
+
+1. Copier les variables:
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+cp .env.example .env.local
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+2. Generer une valeur forte pour `AUTH_SECRET`:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+openssl rand -base64 48
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+3. Installer les dependances et lancer:
 
-## Learn More
+```bash
+npm install
+npm run dev
+```
 
-To learn more about Next.js, take a look at the following resources:
+## Variables d'environnement
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Variables obligatoires:
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```bash
+ADMIN_USER=admin
+ADMIN_PASSWORD=change-me-strong-password
+AUTH_SECRET=replace-with-a-long-random-value
+WHM_HOST=https://campus01.o2switch.net:2087
+WHM_USER=root
+WHM_TOKEN=replace-with-whm-api-token
+```
 
-## Deploy on Vercel
+Notes:
+- fallback supporte: `ADMIN_BASIC_USER` / `ADMIN_BASIC_PASSWORD`
+- si la configuration auth est absente, l'app retourne `503 Authentication is not configured on the server.`
+- si WHM utilise un certificat auto-signe, vous pouvez devoir definir `NODE_TLS_REJECT_UNAUTHORIZED=0`
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Qualite
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```bash
+npm run lint
+npm run build
+```
+
+Le script `build` utilise `webpack` pour eviter un crash Turbopack observe sur certains environnements limites.
+
+## Deploiement Vercel (recommande)
+
+1. Importer le repository GitHub dans Vercel.
+2. Definir toutes les variables d'environnement ci-dessus dans le projet Vercel.
+3. Conserver:
+- Build Command: `npm run build`
+- Install Command: `npm install`
+- Start Command: `npm run start`
+4. Deployer.
+
+## Deploiement Railway (si necessaire)
+
+Railway est utile si vous devez:
+- controler plus finement l'environnement runtime
+- contourner des contraintes reseau de Vercel vers votre WHM
+
+Configuration:
+1. Connecter le repository GitHub a Railway.
+2. Definir les memes variables d'environnement que Vercel.
+3. Commandes:
+- Build: `npm run build`
+- Start: `npm run start`
+4. Exposer le service web sur le port `PORT` fourni par Railway.
+
+## Securite
+
+- Session admin via cookie `HttpOnly` signe (`/login`)
+- routes API protegees via middleware
+- entetes de defense (`X-Frame-Options`, `X-Content-Type-Options`, etc.)
