@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { suspendAccount, unsuspendAccount, deleteAccount } from "@/lib/whm";
 import { requireAuth, safeError } from "@/lib/auth";
+import { isValidCpanelUsername } from "@/lib/validators";
 
 const VALID_ACTIONS = ["suspend", "unsuspend", "delete"] as const;
-const USERNAME_RE = /^[a-z][a-z0-9]{2,7}$/;
 
 export async function POST(req: NextRequest) {
     const denied = await requireAuth(req);
@@ -15,7 +15,7 @@ export async function POST(req: NextRequest) {
         if (!user || !action) {
             return NextResponse.json({ error: "Paramètres manquants" }, { status: 400 });
         }
-        if (!USERNAME_RE.test(user)) {
+        if (!isValidCpanelUsername(user)) {
             return NextResponse.json({ error: "Username invalide" }, { status: 400 });
         }
         if (!VALID_ACTIONS.includes(action)) {

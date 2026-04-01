@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCPanelSessionData } from "@/lib/whm";
 import { requireAuth, safeError } from "@/lib/auth";
+import { isValidCpanelUsername } from "@/lib/validators";
 
-const USERNAME_RE = /^[a-z][a-z0-9]{2,7}$/;
 type UnknownRecord = Record<string, unknown>;
 
 interface SoftaculousInstallation {
@@ -60,7 +60,7 @@ export async function GET(req: NextRequest) {
         const { searchParams } = new URL(req.url);
         const user = searchParams.get("user");
 
-        if (!user || !USERNAME_RE.test(user)) {
+        if (!user || !isValidCpanelUsername(user)) {
             return NextResponse.json({ error: "Utilisateur manquant ou invalide" }, { status: 400 });
         }
 

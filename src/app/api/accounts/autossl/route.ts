@@ -1,8 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireAuth, safeError } from "@/lib/auth";
 import { startAutoSSLCheck } from "@/lib/whm";
-
-const USERNAME_RE = /^[a-z][a-z0-9]{2,7}$/;
+import { isValidCpanelUsername } from "@/lib/validators";
 
 export async function POST(req: NextRequest) {
     const denied = await requireAuth(req);
@@ -11,7 +10,7 @@ export async function POST(req: NextRequest) {
     try {
         const { user } = await req.json();
 
-        if (!user || !USERNAME_RE.test(user)) {
+        if (!user || !isValidCpanelUsername(user)) {
             return NextResponse.json({ error: "Utilisateur manquant ou invalide" }, { status: 400 });
         }
 

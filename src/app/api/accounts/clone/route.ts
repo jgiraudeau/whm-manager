@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCPanelSessionData } from "@/lib/whm";
 import { requireAuth, safeError } from "@/lib/auth";
+import { isValidCpanelUsername } from "@/lib/validators";
 
-const USERNAME_RE = /^[a-z][a-z0-9]{2,7}$/;
 const SUBDOMAIN_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/i;
 const DOMAIN_RE = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$/i;
 
@@ -65,7 +65,7 @@ export async function POST(req: NextRequest) {
         if (!user || !sourceUrl || !targetSubdomain || !domain) {
             return NextResponse.json({ error: "Paramètres manquants" }, { status: 400 });
         }
-        if (!USERNAME_RE.test(user)) {
+        if (!isValidCpanelUsername(user)) {
             return NextResponse.json({ error: "Username invalide" }, { status: 400 });
         }
         if (!SUBDOMAIN_RE.test(targetSubdomain)) {

@@ -1,13 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCPanelSessionData } from "@/lib/whm";
 import { requireAuth, safeError } from "@/lib/auth";
+import { isValidCpanelUsername } from "@/lib/validators";
 
 const SOFTACULOUS_APPS: Record<string, { id: number; name: string }> = {
     wordpress: { id: 26, name: "WordPress" },
     prestashop: { id: 29, name: "PrestaShop" },
 };
 
-const USERNAME_RE = /^[a-z][a-z0-9]{2,7}$/;
 const DOMAIN_RE = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$/i;
 
 function generateSecurePassword(): string {
@@ -27,7 +27,7 @@ export async function POST(req: NextRequest) {
         if (!user || !app || !targetDomain) {
             return NextResponse.json({ error: "Paramètres manquants" }, { status: 400 });
         }
-        if (!USERNAME_RE.test(user)) {
+        if (!isValidCpanelUsername(user)) {
             return NextResponse.json({ error: "Username invalide" }, { status: 400 });
         }
         if (!DOMAIN_RE.test(targetDomain)) {
