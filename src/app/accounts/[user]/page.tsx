@@ -240,7 +240,9 @@ export default function AccountDetailPage() {
                 body: JSON.stringify({ user, sourceRef: cloneSourceUrl, targetSubdomain: cloneSubdomain, domain: account?.domain }),
             });
             const data = await res.json();
-            if (data.error) throw new Error(data.error);
+            if (!res.ok || data.error || data.success === false) {
+                throw new Error(data.error || data.message || "Le clonage n'a pas été confirmé");
+            }
 
             setCloneStep(3); // Finishing
             await new Promise(r => setTimeout(r, 2000)); // Mimic propagation

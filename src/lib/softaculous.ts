@@ -20,6 +20,33 @@ function isString(value: unknown): value is string {
   return typeof value === "string";
 }
 
+function firstErrorMessage(value: unknown): string | null {
+  if (isString(value)) {
+    const trimmed = value.trim();
+    return trimmed ? trimmed : null;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const message = firstErrorMessage(item);
+      if (message) return message;
+    }
+    return null;
+  }
+
+  const record = asRecord(value);
+  if (!record) return null;
+
+  for (const [key, item] of Object.entries(record)) {
+    const message = firstErrorMessage(item);
+    if (message) {
+      // Keep key context for field-level errors like { softdomain: "..." }.
+      return key === "fatal_error_text" ? message : `${key}: ${message}`;
+    }
+  }
+  return null;
+}
+
 function isDigits(value: string): boolean {
   return /^\d+$/.test(value);
 }
@@ -115,12 +142,5 @@ export function extractSoftaculousError(data: unknown): string | null {
   if (!root) return null;
 
   const errorValue = root.error ?? root.errors ?? asRecord(root.data)?.error;
-  if (isString(errorValue) && errorValue.trim()) return errorValue;
-
-  if (Array.isArray(errorValue)) {
-    const first = errorValue.find((item) => isString(item) && item.trim());
-    if (isString(first)) return first;
-  }
-
-  return null;
+  return firstErrorMessage(errorValue);
 }
