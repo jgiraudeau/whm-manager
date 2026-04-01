@@ -2,52 +2,14 @@ import { NextRequest, NextResponse } from "next/server";
 import { getCPanelSessionData } from "@/lib/whm";
 import { requireAuth, safeError } from "@/lib/auth";
 import { isValidCpanelUsername } from "@/lib/validators";
+import {
+    extractSoftaculousError,
+    extractSoftaculousInstallations,
+    normalizeHost,
+} from "@/lib/softaculous";
 
 const SUBDOMAIN_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/i;
 const DOMAIN_RE = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$/i;
-
-type UnknownRecord = Record<string, unknown>;
-
-interface SoftaculousInstallation {
-    softurl?: string;
-    domain?: string;
-    script_name?: string;
-    softname?: string;
-    softpath?: string;
-    ver?: string;
-}
-
-function asRecord(value: unknown): UnknownRecord | null {
-    if (typeof value === "object" && value !== null) {
-        return value as UnknownRecord;
-    }
-    return null;
-}
-
-function extractInstallationsData(payload: unknown): Record<string, SoftaculousInstallation> {
-    const root = asRecord(payload);
-    if (!root) return {};
-
-    const dataNode = asRecord(root.data);
-    const installationsCandidate = dataNode?.installations ?? root.installations;
-    const groupedInstallations = asRecord(installationsCandidate);
-    if (!groupedInstallations) return {};
-
-    const flattened: Record<string, SoftaculousInstallation> = {};
-
-    for (const scriptInstalls of Object.values(groupedInstallations)) {
-        const installsForScript = asRecord(scriptInstalls);
-        if (!installsForScript) continue;
-
-        for (const [id, install] of Object.entries(installsForScript)) {
-            const installation = asRecord(install) as SoftaculousInstallation | null;
-            if (!installation) continue;
-            flattened[id] = installation;
-        }
-    }
-
-    return flattened;
-}
 
 function secureDbSuffix(): string {
     const bytes = new Uint8Array(4);
@@ -85,21 +47,42 @@ export async function POST(req: NextRequest) {
 
         const listText = await listRes.text();
         let installId: string | null = null;
+        let detectedInstallations: string[] = [];
 
         try {
             const parsed = JSON.parse(listText) as unknown;
-            const installations = extractInstallationsData(parsed);
-            const sourceHost = sourceUrl.replace(/https?:\/\//, "").split("/")[0];
+            const installations = extractSoftaculousInstallations(parsed);
+            const sourceHost = normalizeHost(sourceUrl);
+            detectedInstallations = Object.values(installations)
+                .map((install) => install.softurl ?? install.domain ?? "")
+                .filter((value) => value.length > 0);
 
             for (const [id, install] of Object.entries(installations)) {
-                const url = install.softurl ?? install.domain ?? "";
-                if (url.includes(sourceHost)) {
+                const installUrl = install.softurl ?? install.domain ?? "";
+                const installHost = normalizeHost(installUrl);
+                if (!installHost) continue;
+
+                if (
+                    installHost === sourceHost ||
+                    installHost.endsWith(`.${sourceHost}`) ||
+                    sourceHost.endsWith(`.${installHost}`)
+                ) {
                     installId = id;
                     break;
                 }
             }
         } catch {
             // JSON parse failed
+        }
+
+        if (!installId) {
+            return NextResponse.json(
+                {
+                    error: "Installation source introuvable dans Softaculous pour ce compte.",
+                    detectedInstallations,
+                },
+                { status: 404 },
+            );
         }
 
         const targetUrl = `${targetSubdomain}.${domain}`;
@@ -124,31 +107,41 @@ export async function POST(req: NextRequest) {
         });
 
         const cloneText = await cloneRes.text();
-        let cloneData: UnknownRecord | null = null;
+        let cloneData: Record<string, unknown> | null = null;
         try {
-            const parsed = JSON.parse(cloneText);
-            cloneData = asRecord(parsed);
+            const parsed = JSON.parse(cloneText) as unknown;
+            if (typeof parsed === "object" && parsed !== null) {
+                cloneData = parsed as Record<string, unknown>;
+            }
         } catch {
             cloneData = null;
         }
 
-        if (!cloneData) {
-            const isSuccess =
-                cloneText.includes("Clone Complete") ||
-                cloneText.includes("cloné") ||
-                cloneText.includes("successfully cloned");
+        const softaculousError = extractSoftaculousError(cloneData);
+        if (softaculousError) {
+            throw new Error(softaculousError);
+        }
 
-            if (!isSuccess && cloneText.includes("error")) {
-                throw new Error("Erreur lors du clonage");
-            }
+        const isSuccess =
+            cloneText.includes("Clone Complete") ||
+            cloneText.includes("cloné") ||
+            cloneText.includes("successfully cloned") ||
+            Boolean(cloneData);
+
+        if (!isSuccess) {
+            throw new Error("Le clonage n'a pas pu être confirmé par Softaculous");
         }
 
         return NextResponse.json({
             success: true,
             message: `Site en cours de clonage vers ${targetUrl}`,
             targetUrl: `https://${targetUrl}`,
-            taskId: typeof cloneData?.taskid === "string" ? cloneData.taskid : null,
-            note: !installId ? "Installation source non trouvée. Clonage manuel possible dans cPanel." : undefined,
+            taskId:
+                typeof cloneData?.taskid === "string"
+                    ? cloneData.taskid
+                    : typeof cloneData?.task_id === "string"
+                        ? cloneData.task_id
+                        : null,
         });
     } catch (error: unknown) {
         return NextResponse.json({ error: safeError(error, "Erreur lors du clonage") }, { status: 500 });

@@ -2,55 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getCPanelSessionData } from "@/lib/whm";
 import { requireAuth, safeError } from "@/lib/auth";
 import { isValidCpanelUsername } from "@/lib/validators";
-
-type UnknownRecord = Record<string, unknown>;
-
-interface SoftaculousInstallation {
-    script_name?: string;
-    softname?: string;
-    softurl?: string;
-    domain?: string;
-    softpath?: string;
-    ver?: string;
-}
-
-function asRecord(value: unknown): UnknownRecord | null {
-    if (typeof value === "object" && value !== null) {
-        return value as UnknownRecord;
-    }
-    return null;
-}
-
-function extractInstallations(payload: unknown): { id: string; name: string; url: string; path: string; ver: string }[] {
-    const root = asRecord(payload);
-    if (!root) return [];
-
-    const dataNode = asRecord(root.data);
-    const grouped = asRecord(root.installations ?? dataNode?.installations);
-    if (!grouped) return [];
-
-    const list: { id: string; name: string; url: string; path: string; ver: string }[] = [];
-
-    for (const scriptInstalls of Object.values(grouped)) {
-        const installsForScript = asRecord(scriptInstalls);
-        if (!installsForScript) continue;
-
-        for (const [id, install] of Object.entries(installsForScript)) {
-            const installation = asRecord(install) as SoftaculousInstallation | null;
-            if (!installation) continue;
-
-            list.push({
-                id,
-                name: installation.script_name ?? installation.softname ?? "Application",
-                url: installation.softurl ?? installation.domain ?? "",
-                path: installation.softpath ?? "",
-                ver: installation.ver ?? "",
-            });
-        }
-    }
-
-    return list;
-}
+import { extractSoftaculousInstallations } from "@/lib/softaculous";
 
 export async function GET(req: NextRequest) {
     const denied = await requireAuth(req);
@@ -79,7 +31,13 @@ export async function GET(req: NextRequest) {
             throw new Error("Réponse Softaculous invalide");
         });
 
-        const list = extractInstallations(data);
+        const list = Object.entries(extractSoftaculousInstallations(data)).map(([id, installation]) => ({
+            id,
+            name: installation.script_name ?? installation.softname ?? "Application",
+            url: installation.softurl ?? installation.domain ?? "",
+            path: installation.softpath ?? "",
+            ver: installation.ver ?? "",
+        }));
 
         return NextResponse.json({ installations: list });
     } catch (error: unknown) {
