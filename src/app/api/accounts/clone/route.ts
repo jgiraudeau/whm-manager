@@ -333,6 +333,9 @@ export async function POST(req: NextRequest) {
 
         throw new Error("Softaculous n'a pas confirmé le clonage et aucune installation cible n'a été détectée");
     } catch (error: unknown) {
-        return NextResponse.json({ error: safeError(error, "Erreur lors du clonage") }, { status: 500 });
+        return NextResponse.json(
+            { success: false, error: safeError(error, "Erreur lors du clonage") },
+            { status: 400 },
+        );
     }
 }
