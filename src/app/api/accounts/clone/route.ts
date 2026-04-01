@@ -89,15 +89,13 @@ export async function POST(req: NextRequest) {
 
         const cloneParams = new URLSearchParams({
             softsubmit: "1",
-            act: "sclone",
             insid: installId || "",
             softdomain: targetUrl,
             softdirectory: "",
             softdb: `cln${secureDbSuffix()}`,
-            api: "json",
         });
 
-        const cloneRes = await fetch(`${baseUrl}/frontend/jupiter/softaculous/index.php`, {
+        const cloneRes = await fetch(`${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=sclone&api=json`, {
             method: "POST",
             headers: {
                 Cookie: cookie,
@@ -117,24 +115,43 @@ export async function POST(req: NextRequest) {
             cloneData = null;
         }
 
+        if (!cloneRes.ok) {
+            throw new Error(`Softaculous clone HTTP ${cloneRes.status}`);
+        }
+
         const softaculousError = extractSoftaculousError(cloneData);
         if (softaculousError) {
             throw new Error(softaculousError);
         }
 
+        const doneMessage =
+            typeof cloneData?.done_msg === "string"
+                ? cloneData.done_msg
+                : typeof cloneData?.msg === "string"
+                    ? cloneData.msg
+                    : null;
+
+        const hasTaskId =
+            typeof cloneData?.taskid === "string" ||
+            typeof cloneData?.task_id === "string";
+
+        const hasDoneFlag = cloneData?.done === true;
+
         const isSuccess =
             cloneText.includes("Clone Complete") ||
             cloneText.includes("cloné") ||
             cloneText.includes("successfully cloned") ||
-            Boolean(cloneData);
+            Boolean(doneMessage) ||
+            hasTaskId ||
+            hasDoneFlag;
 
         if (!isSuccess) {
-            throw new Error("Le clonage n'a pas pu être confirmé par Softaculous");
+            throw new Error("Softaculous n'a pas confirmé le clonage (insid/source/url à vérifier)");
         }
 
         return NextResponse.json({
             success: true,
-            message: `Site en cours de clonage vers ${targetUrl}`,
+            message: doneMessage ?? `Site en cours de clonage vers ${targetUrl}`,
             targetUrl: `https://${targetUrl}`,
             taskId:
                 typeof cloneData?.taskid === "string"

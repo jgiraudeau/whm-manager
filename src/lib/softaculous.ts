@@ -20,6 +20,10 @@ function isString(value: unknown): value is string {
   return typeof value === "string";
 }
 
+function isDigits(value: string): boolean {
+  return /^\d+$/.test(value);
+}
+
 function looksLikeInstallation(value: unknown): value is SoftaculousInstallation {
   const record = asRecord(value);
   if (!record) return false;
@@ -74,7 +78,16 @@ export function extractSoftaculousInstallations(payload: unknown): Record<string
     for (const [nestedId, nestedValue] of Object.entries(nested)) {
       if (!looksLikeInstallation(nestedValue)) continue;
       const installation = sanitizeInstallation(nestedValue);
-      if (installation) out[nestedId] = installation;
+      if (!installation) continue;
+
+      // Softaculous clone expects insid like "<scriptId>_<installId>".
+      // Some payloads expose grouped keys where nested ids are plain numbers.
+      const compositeId =
+        isDigits(key) && !nestedId.includes("_") && isDigits(nestedId)
+          ? `${key}_${nestedId}`
+          : nestedId;
+
+      out[compositeId] = installation;
     }
   }
 
