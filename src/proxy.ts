@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { SESSION_COOKIE_NAME, authIsConfigured, verifySessionToken } from "@/lib/auth";
+import { SESSION_COOKIE_NAME } from "@/lib/auth";
 
 function isPublicPath(pathname: string): boolean {
   return pathname === "/login" || pathname.startsWith("/api/auth/");
@@ -11,28 +11,16 @@ function unauthorizedApiResponse() {
 
 export async function proxy(req: NextRequest) {
   const { pathname, search } = req.nextUrl;
-
-  if (!authIsConfigured()) {
-    if (pathname.startsWith("/api/")) {
-      return NextResponse.json(
-        { error: "Authentication is not configured on the server." },
-        { status: 503 },
-      );
-    }
-    return new NextResponse("Authentication is not configured on the server.", { status: 503 });
-  }
-
   const token = req.cookies.get(SESSION_COOKIE_NAME)?.value;
-  const session = token ? await verifySessionToken(token) : null;
 
   if (isPublicPath(pathname)) {
-    if (pathname === "/login" && session) {
+    if (pathname === "/login" && token) {
       return NextResponse.redirect(new URL("/", req.url));
     }
     return NextResponse.next();
   }
 
-  if (!session) {
+  if (!token) {
     if (pathname.startsWith("/api/")) {
       return unauthorizedApiResponse();
     }
