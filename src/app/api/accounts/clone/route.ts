@@ -22,9 +22,10 @@ export async function POST(req: NextRequest) {
     if (denied) return denied;
 
     try {
-        const { user, sourceUrl, targetSubdomain, domain } = await req.json();
+        const { user, sourceUrl, sourceRef, sourceInstallationId, targetSubdomain, domain } = await req.json();
+        const sourceInput = sourceInstallationId ?? sourceRef ?? sourceUrl;
 
-        if (!user || !sourceUrl || !targetSubdomain || !domain) {
+        if (!user || !sourceInput || !targetSubdomain || !domain) {
             return NextResponse.json({ error: "Paramètres manquants" }, { status: 400 });
         }
         if (!isValidCpanelUsername(user)) {
@@ -49,30 +50,38 @@ export async function POST(req: NextRequest) {
         let installId: string | null = null;
         let detectedInstallations: string[] = [];
 
-        try {
-            const parsed = JSON.parse(listText) as unknown;
-            const installations = extractSoftaculousInstallations(parsed);
-            const sourceHost = normalizeHost(sourceUrl);
-            detectedInstallations = Object.values(installations)
-                .map((install) => install.softurl ?? install.domain ?? "")
-                .filter((value) => value.length > 0);
+        const sourceAsText = String(sourceInput).trim();
+        const looksLikeInsid = /^\d+(_\d+)?$/.test(sourceAsText);
+        if (looksLikeInsid) {
+            installId = sourceAsText;
+        }
 
-            for (const [id, install] of Object.entries(installations)) {
-                const installUrl = install.softurl ?? install.domain ?? "";
-                const installHost = normalizeHost(installUrl);
-                if (!installHost) continue;
+        if (!installId) {
+            try {
+                const parsed = JSON.parse(listText) as unknown;
+                const installations = extractSoftaculousInstallations(parsed);
+                const sourceHost = normalizeHost(sourceAsText);
+                detectedInstallations = Object.values(installations)
+                    .map((install) => install.softurl ?? install.domain ?? "")
+                    .filter((value) => value.length > 0);
 
-                if (
-                    installHost === sourceHost ||
-                    installHost.endsWith(`.${sourceHost}`) ||
-                    sourceHost.endsWith(`.${installHost}`)
-                ) {
-                    installId = id;
-                    break;
+                for (const [id, install] of Object.entries(installations)) {
+                    const installUrl = install.softurl ?? install.domain ?? "";
+                    const installHost = normalizeHost(installUrl);
+                    if (!installHost) continue;
+
+                    if (
+                        installHost === sourceHost ||
+                        installHost.endsWith(`.${sourceHost}`) ||
+                        sourceHost.endsWith(`.${installHost}`)
+                    ) {
+                        installId = id;
+                        break;
+                    }
                 }
+            } catch {
+                // JSON parse failed
             }
-        } catch {
-            // JSON parse failed
         }
 
         if (!installId) {

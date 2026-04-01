@@ -237,7 +237,7 @@ export default function AccountDetailPage() {
             const res = await fetch("/api/accounts/clone", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ user, sourceUrl: cloneSourceUrl, targetSubdomain: cloneSubdomain, domain: account?.domain }),
+                body: JSON.stringify({ user, sourceRef: cloneSourceUrl, targetSubdomain: cloneSubdomain, domain: account?.domain }),
             });
             const data = await res.json();
             if (data.error) throw new Error(data.error);
@@ -543,7 +543,7 @@ export default function AccountDetailPage() {
                             >
                                 <option value="">--- Sélectionner une installation ---</option>
                                 {installations.map(ins => (
-                                    <option key={ins.id} value={ins.url}>{ins.name} ({ins.url})</option>
+                                    <option key={ins.id} value={ins.id}>{ins.name} ({ins.url})</option>
                                 ))}
                             </select>
                         ) : (
