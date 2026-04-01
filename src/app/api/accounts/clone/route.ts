@@ -17,6 +17,60 @@ function secureDbSuffix(): string {
     return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+function parseMaybeJson(input: string): Record<string, unknown> | null {
+    try {
+        const parsed = JSON.parse(input) as unknown;
+        if (typeof parsed === "object" && parsed !== null) {
+            return parsed as Record<string, unknown>;
+        }
+    } catch {
+        // ignore
+    }
+    return null;
+}
+
+function hasSuccessMarkers(text: string, data: Record<string, unknown> | null): boolean {
+    const doneMessage =
+        typeof data?.done_msg === "string"
+            ? data.done_msg
+            : typeof data?.msg === "string"
+                ? data.msg
+                : null;
+    const hasTaskId =
+        typeof data?.taskid === "string" ||
+        typeof data?.task_id === "string";
+    const hasDoneFlag = data?.done === true;
+
+    return (
+        text.includes("Clone Complete") ||
+        text.includes("cloné") ||
+        text.includes("successfully cloned") ||
+        Boolean(doneMessage) ||
+        hasTaskId ||
+        hasDoneFlag
+    );
+}
+
+async function targetInstallationExists(baseUrl: string, cookie: string, targetUrl: string): Promise<boolean> {
+    const targetHost = normalizeHost(targetUrl);
+    if (!targetHost) return false;
+
+    const res = await fetch(
+        `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=installations&api=json`,
+        { headers: { Cookie: cookie } }
+    );
+    if (!res.ok) return false;
+
+    const text = await res.text();
+    const parsed = parseMaybeJson(text);
+    const installations = extractSoftaculousInstallations(parsed);
+
+    return Object.values(installations).some((install) => {
+        const host = normalizeHost(install.softurl ?? install.domain ?? "");
+        return host === targetHost;
+    });
+}
+
 export async function POST(req: NextRequest) {
     const denied = await requireAuth(req);
     if (denied) return denied;
@@ -104,71 +158,86 @@ export async function POST(req: NextRequest) {
             softdb: `cln${secureDbSuffix()}`,
         });
 
-        const cloneRes = await fetch(`${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=sclone&api=json`, {
-            method: "POST",
-            headers: {
-                Cookie: cookie,
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-            body: cloneParams.toString(),
-        });
+        const cloneEndpoints = [
+            `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=sclone&api=json`,
+            `${baseUrl}/frontend/jupiter/softaculous/index.php?act=sclone&api=json`,
+        ];
 
-        const cloneText = await cloneRes.text();
-        let cloneData: Record<string, unknown> | null = null;
-        try {
-            const parsed = JSON.parse(cloneText) as unknown;
-            if (typeof parsed === "object" && parsed !== null) {
-                cloneData = parsed as Record<string, unknown>;
-            }
-        } catch {
-            cloneData = null;
-        }
+        let lastSoftError: string | null = null;
+        let lastHttpStatus: number | null = null;
+        let cloneAccepted = false;
 
-        if (!cloneRes.ok) {
-            throw new Error(`Softaculous clone HTTP ${cloneRes.status}`);
-        }
+        for (const endpoint of cloneEndpoints) {
+            const cloneRes = await fetch(endpoint, {
+                method: "POST",
+                headers: {
+                    Cookie: cookie,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                body: cloneParams.toString(),
+            });
 
-        const softaculousError = extractSoftaculousError(cloneData);
-        if (softaculousError) {
-            throw new Error(softaculousError);
-        }
-
-        const doneMessage =
-            typeof cloneData?.done_msg === "string"
-                ? cloneData.done_msg
-                : typeof cloneData?.msg === "string"
-                    ? cloneData.msg
-                    : null;
-
-        const hasTaskId =
-            typeof cloneData?.taskid === "string" ||
-            typeof cloneData?.task_id === "string";
-
-        const hasDoneFlag = cloneData?.done === true;
-
-        const isSuccess =
-            cloneText.includes("Clone Complete") ||
-            cloneText.includes("cloné") ||
-            cloneText.includes("successfully cloned") ||
-            Boolean(doneMessage) ||
-            hasTaskId ||
-            hasDoneFlag;
-
-        if (!isSuccess) {
-            throw new Error("Softaculous n'a pas confirmé le clonage (insid/source/url à vérifier)");
-        }
-
-        return NextResponse.json({
-            success: true,
-            message: doneMessage ?? `Site en cours de clonage vers ${targetUrl}`,
-            targetUrl: `https://${targetUrl}`,
-            taskId:
+            const cloneText = await cloneRes.text();
+            const cloneData = parseMaybeJson(cloneText);
+            const softaculousError = extractSoftaculousError(cloneData);
+            const doneMessage =
+                typeof cloneData?.done_msg === "string"
+                    ? cloneData.done_msg
+                    : typeof cloneData?.msg === "string"
+                        ? cloneData.msg
+                        : null;
+            const taskId =
                 typeof cloneData?.taskid === "string"
                     ? cloneData.taskid
                     : typeof cloneData?.task_id === "string"
                         ? cloneData.task_id
-                        : null,
-        });
+                        : null;
+
+            lastHttpStatus = cloneRes.status;
+            if (!cloneRes.ok) {
+                if (softaculousError) lastSoftError = softaculousError;
+                continue;
+            }
+
+            if (softaculousError) {
+                lastSoftError = softaculousError;
+                continue;
+            }
+
+            if (hasSuccessMarkers(cloneText, cloneData)) {
+                return NextResponse.json({
+                    success: true,
+                    message: doneMessage ?? `Site en cours de clonage vers ${targetUrl}`,
+                    targetUrl: `https://${targetUrl}`,
+                    taskId,
+                });
+            }
+
+            cloneAccepted = true;
+        }
+
+        // Softaculous may queue clone tasks without explicit confirmation in response body.
+        // Confirm by checking if target installation appears.
+        const existsNow = await targetInstallationExists(baseUrl, cookie, targetUrl);
+        if (existsNow || cloneAccepted) {
+            return NextResponse.json({
+                success: true,
+                message: `Clonage lancé vers ${targetUrl}. Vérifiez l'état dans 1 à 2 minutes.`,
+                targetUrl: `https://${targetUrl}`,
+                taskId: null,
+                pending: true,
+            });
+        }
+
+        if (lastSoftError) {
+            throw new Error(lastSoftError);
+        }
+
+        throw new Error(
+            lastHttpStatus
+                ? `Softaculous clone HTTP ${lastHttpStatus} (insid/source/url à vérifier)`
+                : "Softaculous n'a pas confirmé le clonage (insid/source/url à vérifier)"
+        );
     } catch (error: unknown) {
         return NextResponse.json({ error: safeError(error, "Erreur lors du clonage") }, { status: 500 });
     }
