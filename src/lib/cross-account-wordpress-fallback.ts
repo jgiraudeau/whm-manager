@@ -319,6 +319,39 @@ function parseApi2Error(data: unknown): string {
   return "";
 }
 
+function isDirectoryAlreadyExistsError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("already exists") ||
+    normalized.includes("existe déjà") ||
+    normalized.includes("file exists")
+  );
+}
+
+async function directoryExistsInParent(
+  destinationUser: string,
+  parentDir: string,
+  directoryName: string,
+): Promise<boolean> {
+  const payload = await cpanelApi(destinationUser, "Fileman", "list_files", {
+    dir: parentDir,
+    show_hidden: "1",
+  });
+
+  const root = asRecord(payload);
+  const result = asRecord(root?.result);
+  const metadata = asRecord(result?.metadata);
+  if (metadata?.result === 0) {
+    return false;
+  }
+
+  const entries = Array.isArray(result?.data) ? result?.data : [];
+  return entries.some((item) => {
+    const entry = asRecord(item);
+    return entry?.file === directoryName && entry?.type === "dir";
+  });
+}
+
 async function ensureDirectory(destinationUser: string, absoluteDir: string): Promise<void> {
   const normalized = normalizeDirPath(absoluteDir);
   const expectedPrefix = `/home/${destinationUser}`;
@@ -336,9 +369,21 @@ async function ensureDirectory(destinationUser: string, absoluteDir: string): Pr
       path: current,
       name: segment,
     });
-    const error = parseApi2Error(result).toLowerCase();
-    if (error && !error.includes("already exists") && !error.includes("existe déjà")) {
-      throw new Error(`Impossible de créer le dossier ${current}/${segment}: ${parseApi2Error(result)}`);
+    const rawError = parseApi2Error(result);
+    const error = rawError.toLowerCase();
+    if (error) {
+      if (isDirectoryAlreadyExistsError(rawError)) {
+        current = `${current}/${segment}`;
+        continue;
+      }
+
+      const exists = await directoryExistsInParent(destinationUser, current, segment);
+      if (exists) {
+        current = `${current}/${segment}`;
+        continue;
+      }
+
+      throw new Error(`Impossible de créer le dossier ${current}/${segment}: ${rawError}`);
     }
     current = `${current}/${segment}`;
   }
