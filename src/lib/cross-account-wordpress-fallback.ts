@@ -60,6 +60,12 @@ interface FileEntry {
   size?: string | number;
 }
 
+interface UploadStrategy {
+  label: string;
+  endpoint: string;
+  form: FormData;
+}
+
 const SKIP_RELATIVE_PREFIXES = [
   "wp-content/ai1wm-backups/",
   "wp-content/updraft/",
@@ -286,31 +292,85 @@ async function uploadDestinationFile(
   fileName: string,
   content: BlobPart,
 ): Promise<void> {
-  const endpoint = `${session.baseUrl}/execute/Fileman/upload_files?dir=${encodeURIComponent(destinationDir)}`;
-  const form = new FormData();
-  form.append("file", new Blob([content]), fileName);
+  const normalizedDir = normalizeDirPath(destinationDir);
+  const homePrefix = `/home/${session.user}`;
+  const relativeDir = normalizedDir === homePrefix
+    ? "."
+    : normalizedDir.startsWith(`${homePrefix}/`)
+      ? normalizedDir.slice(homePrefix.length + 1)
+      : normalizedDir.replace(/^\/+/, "") || ".";
 
-  const res = await fetchInsecure(endpoint, {
-    method: "POST",
-    headers: { Cookie: session.cookie },
-    body: form,
-  });
-  const text = await res.text();
-  let parsed: UnknownRecord | null = null;
-  try {
-    parsed = JSON.parse(text) as UnknownRecord;
-  } catch {
-    parsed = null;
+  const buildForm = (fileField: "file" | "file-1", includeDirField: boolean): FormData => {
+    const form = new FormData();
+    if (includeDirField) {
+      form.append("dir", relativeDir);
+    }
+    form.append(fileField, new Blob([content]), fileName);
+    return form;
+  };
+
+  const strategies: UploadStrategy[] = [
+    {
+      // cPanel guide: multipart payload with dir + file-1 fields.
+      label: "dir+file-1",
+      endpoint: `${session.baseUrl}/execute/Fileman/upload_files`,
+      form: buildForm("file-1", true),
+    },
+    {
+      // cURL examples often use `file` as upload field.
+      label: "dir+file",
+      endpoint: `${session.baseUrl}/execute/Fileman/upload_files`,
+      form: buildForm("file", true),
+    },
+    {
+      // Backward-compat with previous behavior.
+      label: "query-dir+file",
+      endpoint: `${session.baseUrl}/execute/Fileman/upload_files?dir=${encodeURIComponent(normalizedDir)}`,
+      form: buildForm("file", false),
+    },
+  ];
+
+  const strategyErrors: string[] = [];
+  for (const strategy of strategies) {
+    try {
+      const res = await fetchInsecure(strategy.endpoint, {
+        method: "POST",
+        headers: { Cookie: session.cookie },
+        body: strategy.form,
+      });
+      const text = await res.text();
+      let parsed: UnknownRecord | null = null;
+      try {
+        parsed = JSON.parse(text) as UnknownRecord;
+      } catch {
+        parsed = null;
+      }
+      if (!parsed) {
+        throw new Error(`Réponse non JSON (HTTP ${res.status})`);
+      }
+
+      const payload = asRecord(parsed.result) ?? parsed;
+      const statusValue = payload.status;
+      const isSuccess = statusValue === 1 || statusValue === "1" || statusValue === true;
+      if (!isSuccess) {
+        const errors = Array.isArray(payload.errors)
+          ? payload.errors.filter((item): item is string => typeof item === "string")
+          : [];
+        const messages = Array.isArray(payload.messages)
+          ? payload.messages.filter((item): item is string => typeof item === "string")
+          : [];
+        throw new Error(errors[0] ?? messages[0] ?? `status=${String(statusValue ?? "unknown")}`);
+      }
+      return;
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : "erreur inconnue";
+      strategyErrors.push(`${strategy.label}: ${detail}`);
+    }
   }
-  if (!parsed) {
-    throw new Error(`Upload destination invalide (${fileName})`);
-  }
-  if (parsed.status !== 1) {
-    const errors = Array.isArray(parsed.errors)
-      ? parsed.errors.filter((item): item is string => typeof item === "string")
-      : [];
-    throw new Error(errors[0] ?? `Upload échoué (${fileName})`);
-  }
+
+  throw new Error(
+    `Upload échoué (${fileName}) vers ${relativeDir}: ${strategyErrors.join(" | ")}`.slice(0, 700),
+  );
 }
 
 function parseApi2Error(data: unknown): string {
