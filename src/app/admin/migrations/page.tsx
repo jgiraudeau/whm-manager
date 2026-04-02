@@ -179,6 +179,25 @@ export default function AdminMigrationsPage() {
     }
   }, []);
 
+  useEffect(() => {
+    if (!preparedPlan) return;
+    const latest = plans.find((plan) => plan.id === preparedPlan.id);
+    if (latest) {
+      setPreparedPlan(latest);
+    }
+  }, [plans, preparedPlan]);
+
+  useEffect(() => {
+    const hasRunningPlan = plans.some((plan) => plan.status === "running");
+    if (!hasRunningPlan) return;
+
+    const timer = window.setInterval(() => {
+      void refreshPlans();
+    }, 4000);
+
+    return () => window.clearInterval(timer);
+  }, [plans, refreshPlans]);
+
   async function prepareMigration() {
     if (!sourceAccount || !sourceRef || !destinationAccount || !destinationSubdomain || !destinationDomain) {
       setError("Merci de renseigner tous les champs de préparation");
