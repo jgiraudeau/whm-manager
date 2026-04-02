@@ -19,6 +19,49 @@ function parseMaybeJson(input: string): Record<string, unknown> | null {
   return null;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatFetchError(url: string, error: unknown): string {
+  if (!(error instanceof Error)) {
+    return `fetch failed (${url})`;
+  }
+  const cause = (error as Error & { cause?: unknown }).cause;
+  let details = error.message || "fetch failed";
+  if (cause && typeof cause === "object") {
+    const record = cause as Record<string, unknown>;
+    const code = typeof record.code === "string" ? record.code : "";
+    const hostname = typeof record.hostname === "string" ? record.hostname : "";
+    if (code && hostname) {
+      details = `${details} [${code} ${hostname}]`;
+    } else if (code) {
+      details = `${details} [${code}]`;
+    }
+  }
+  return details;
+}
+
+async function fetchWithRetry(url: string, init?: RequestInit): Promise<Response> {
+  const attempts = 3;
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await fetch(url, init);
+    } catch (error: unknown) {
+      lastError = error;
+      if (attempt < attempts) {
+        await sleep(250 * attempt);
+        continue;
+      }
+    }
+  }
+
+  throw new Error(formatFetchError(url, lastError), {
+    cause: lastError instanceof Error ? lastError : undefined,
+  });
+}
+
 export type SoftAppType = "wordpress" | "prestashop" | "other";
 
 export interface SoftaculousInstallationSummary {
@@ -67,7 +110,7 @@ export async function listSoftaculousInstallationsForUser(
 
   const { host, cpsess, cookie } = await getCPanelSessionData(user);
   const baseUrl = `https://${host}:2083/${cpsess}`;
-  const res = await fetch(
+  const res = await fetchWithRetry(
     `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=installations&api=json`,
     { headers: { Cookie: cookie } },
   );
@@ -127,7 +170,7 @@ export async function triggerSoftaculousBackup(
   const { host, cpsess, cookie } = await getCPanelSessionData(user);
   const baseUrl = `https://${host}:2083/${cpsess}`;
 
-  const res = await fetch(
+  const res = await fetchWithRetry(
     `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=backup&insid=${encodeURIComponent(
       installationId,
     )}&api=json`,

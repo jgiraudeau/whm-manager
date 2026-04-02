@@ -98,6 +98,36 @@ function randomToken(size = 16): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatFetchError(url: string, error: unknown): string {
+  if (!(error instanceof Error)) {
+    return `fetch failed (${url})`;
+  }
+
+  const cause = (error as Error & { cause?: unknown }).cause;
+  let details = error.message || "fetch failed";
+  if (cause && typeof cause === "object") {
+    const record = cause as UnknownRecord;
+    const code = typeof record.code === "string" ? record.code : "";
+    const hostname = typeof record.hostname === "string" ? record.hostname : "";
+    if (code && hostname) {
+      details = `${details} [${code} ${hostname}]`;
+    } else if (code) {
+      details = `${details} [${code}]`;
+    }
+  }
+
+  try {
+    const host = new URL(url).host;
+    return `${details} (url host: ${host})`;
+  } catch {
+    return `${details} (url: ${url})`;
+  }
+}
+
 function sanitizeName(input: string): string {
   return input.toLowerCase().replace(/[^a-z0-9_]/g, "_");
 }
@@ -128,8 +158,23 @@ function parseWordPressConfigFromSoftaculous(
 async function fetchInsecure(url: string, init?: RequestInit): Promise<Response> {
   const previous = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+  const attempts = 3;
+  let lastError: unknown = null;
   try {
-    return await fetch(url, init);
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        return await fetch(url, init);
+      } catch (error: unknown) {
+        lastError = error;
+        if (attempt < attempts) {
+          await sleep(250 * attempt);
+          continue;
+        }
+      }
+    }
+    throw new Error(formatFetchError(url, lastError), {
+      cause: lastError instanceof Error ? lastError : undefined,
+    });
   } finally {
     if (previous === undefined) {
       delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
@@ -638,6 +683,7 @@ export async function runWordPressCrossAccountCloneFallback(
   input: FallbackCloneInput,
   onLog?: (message: string) => Promise<void> | void,
 ): Promise<WordPressFallbackCloneResult> {
+  await onLog?.("Fallback: chargement des installations source");
   const sourceInstallations = await listSoftaculousInstallationsForUser(input.sourceAccount);
   const sourceInstallation = resolveSourceInstallation(sourceInstallations, input.sourceInstallationId);
 
@@ -650,11 +696,13 @@ export async function runWordPressCrossAccountCloneFallback(
     throw new Error(`Chemin source invalide: ${sourcePath || "(vide)"}`);
   }
 
+  await onLog?.("Fallback: résolution du document root destination");
   const targetHost = normalizeHost(input.targetUrl);
   const destinationPath = normalizeDirPath(
     await resolveDestinationDocumentRoot(input.destinationAccount, targetHost, input.destinationSubdomain),
   );
 
+  await onLog?.("Fallback: ouverture des sessions cPanel source/destination");
   const sourceSession = await createSessionContext(input.sourceAccount);
   const destinationSession = await createSessionContext(input.destinationAccount);
 

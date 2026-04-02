@@ -13,6 +13,27 @@ interface ExecuteBody {
   planId?: string;
 }
 
+function describeUnknownError(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return "Erreur inconnue";
+  }
+
+  const cause = (error as Error & { cause?: unknown }).cause;
+  if (cause && typeof cause === "object") {
+    const causeRecord = cause as Record<string, unknown>;
+    const code = typeof causeRecord.code === "string" ? causeRecord.code : "";
+    const hostname = typeof causeRecord.hostname === "string" ? causeRecord.hostname : "";
+    if (code && hostname) {
+      return `${error.message} (${code} ${hostname})`;
+    }
+    if (code) {
+      return `${error.message} (${code})`;
+    }
+  }
+
+  return error.message || "Erreur inconnue";
+}
+
 function backupRestoreDisabled(message: string): boolean {
   const text = message.toLowerCase();
   return (
@@ -129,10 +150,11 @@ export async function POST(req: NextRequest) {
             plan: completed,
           });
         } catch (fallbackError: unknown) {
-          const fallbackMessage = safeError(
-            fallbackError,
-            "Fallback WordPress échoué pendant la copie fichiers/base",
-          );
+          const fallbackMessage = describeUnknownError(fallbackError)
+            || safeError(
+              fallbackError,
+              "Fallback WordPress échoué pendant la copie fichiers/base",
+            );
           const blocked = await updateMigrationById(planId, (plan) => {
             const withLog = appendExecutionLog(plan, `Fallback échoué: ${fallbackMessage}`);
             return {
