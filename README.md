@@ -8,6 +8,8 @@ Application Next.js pour piloter des comptes WHM/cPanel (o2switch):
 - declenchement AutoSSL
 - gestion des droits d'acces par utilisateur (RBAC)
 - preparation de migrations inter-compte (source/cible + checks + plan)
+- execution de migration inter-compte (phase 2)
+- fallback WordPress sans Softaculous Backup/Restore (copie fichiers + duplication base)
 
 ## Prerequis
 
@@ -54,6 +56,7 @@ Notes:
 - si la configuration auth est absente, l'app retourne `503 Authentication is not configured on the server.`
 - si WHM utilise un certificat auto-signe, vous pouvez devoir definir `NODE_TLS_REJECT_UNAUTHORIZED=0`
 - stockage RBAC (optionnel): `ACCESS_CONTROL_STORE_PATH=/chemin/persistant/access-control.json`
+- stockage migrations (optionnel): `MIGRATION_STORE_PATH=/chemin/persistant/migrations.json`
 
 ## Qualite
 
@@ -76,6 +79,7 @@ Le script `build` utilise `webpack` pour eviter un crash Turbopack observe sur c
 5. RBAC:
 - par defaut Vercel ecrit le fichier d'acces dans `/tmp/whm-manager-access-control.json` (non persistant entre redemarrages)
 - pour une persistence durable des droits, preferer Railway avec un volume disque et definir `ACCESS_CONTROL_STORE_PATH`
+- idem pour les migrations: `/tmp/whm-manager-migrations.json` sur Vercel (non persistant)
 
 ## Deploiement Railway (si necessaire)
 
@@ -90,6 +94,7 @@ Configuration:
 - Build: `npm run build`
 - Start: `npm run start`
 4. Exposer le service web sur le port `PORT` fourni par Railway.
+5. Monter un volume persistant sur `/data` (l'app y stocke automatiquement RBAC + migrations si disponible).
 
 ## Securite
 
@@ -102,5 +107,7 @@ Configuration:
 - migrations inter-compte:
   - console superadmin: `/admin/migrations`
   - endpoint de preparation: `POST /api/admin/migrations/cross-account/prepare`
+  - endpoint d'execution: `POST /api/admin/migrations/cross-account/execute`
   - historique des plans: `GET /api/admin/migrations/cross-account`
   - stockage local des plans: `MIGRATION_STORE_PATH` (sinon `data/migrations.json` hors Vercel, `/tmp` sur Vercel)
+  - fallback WordPress automatique si `off_backup_restore` (quand Softaculous Backup/Restore est desactive)

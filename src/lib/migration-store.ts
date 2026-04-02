@@ -10,6 +10,8 @@ export interface MigrationExecutionState {
   backupTriggered?: boolean;
   backupMessage?: string;
   blockerReason?: string;
+  fallbackUsed?: boolean;
+  fallbackSummary?: string;
   logs: string[];
 }
 
@@ -83,6 +85,9 @@ function normalizePlan(raw: unknown): CrossAccountMigrationPlan | null {
           typeof executionInput.backupMessage === "string" ? executionInput.backupMessage : undefined,
         blockerReason:
           typeof executionInput.blockerReason === "string" ? executionInput.blockerReason : undefined,
+        fallbackUsed: Boolean(executionInput.fallbackUsed),
+        fallbackSummary:
+          typeof executionInput.fallbackSummary === "string" ? executionInput.fallbackSummary : undefined,
         logs: Array.isArray(executionInput.logs)
           ? executionInput.logs.filter((item): item is string => typeof item === "string")
           : [],

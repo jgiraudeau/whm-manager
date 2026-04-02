@@ -211,6 +211,26 @@ export async function cpanelApi(user: string, module: string, func: string, para
     });
 }
 
+/**
+ * Relay a call to cPanel API2 through WHM.
+ * Some legacy Fileman operations (mkdir, fileop unlink, etc.) are still only exposed via API2.
+ */
+export async function cpanelApi2(
+    user: string,
+    module: string,
+    func: string,
+    params: Record<string, string> = {},
+) {
+    return whmFetch("cpanel", {
+        user,
+        cpanel_jsonapi_user: user,
+        cpanel_jsonapi_module: module,
+        cpanel_jsonapi_func: func,
+        cpanel_jsonapi_apiversion: "2",
+        ...params,
+    });
+}
+
 // Helper: generate username from name
 export function generateUsername(firstName: string, lastName: string): string {
     const clean = (s: string) =>

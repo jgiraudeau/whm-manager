@@ -46,6 +46,8 @@ interface MigrationPlan {
     backupTriggered?: boolean;
     backupMessage?: string;
     blockerReason?: string;
+    fallbackUsed?: boolean;
+    fallbackSummary?: string;
     logs?: string[];
   };
 }
@@ -453,6 +455,11 @@ export default function AdminMigrationsPage() {
                     <span className="text-gray-500">Backup:</span> {preparedPlan.execution.backupMessage}
                   </p>
                 )}
+                {preparedPlan.execution?.fallbackSummary && (
+                  <p className="text-gray-300">
+                    <span className="text-gray-500">Fallback:</span> {preparedPlan.execution.fallbackSummary}
+                  </p>
+                )}
                 {preparedPlan.execution?.blockerReason && (
                   <p className="text-red-300">
                     <span className="text-red-400">Blocage:</span> {preparedPlan.execution.blockerReason}
@@ -511,6 +518,9 @@ export default function AdminMigrationsPage() {
                         <p className="text-xs text-gray-500 truncate">{plan.targetUrl}</p>
                         {plan.execution?.backupMessage && (
                           <p className="text-[11px] text-gray-400 mt-1">{plan.execution.backupMessage}</p>
+                        )}
+                        {plan.execution?.fallbackSummary && (
+                          <p className="text-[11px] text-gray-400 mt-1">{plan.execution.fallbackSummary}</p>
                         )}
                       </div>
                       <div className="flex flex-col items-end gap-2">
