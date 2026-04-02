@@ -66,6 +66,11 @@ interface UploadStrategy {
   form: FormData;
 }
 
+interface FetchInsecureOptions {
+  timeoutMs?: number;
+  attempts?: number;
+}
+
 const SKIP_RELATIVE_PREFIXES = [
   "wp-content/ai1wm-backups/",
   "wp-content/updraft/",
@@ -79,6 +84,11 @@ const SKIP_RELATIVE_PREFIXES = [
 const MAX_FILES_TO_COPY = 6000;
 const MAX_BYTES_TO_COPY = 1024 * 1024 * 1024; // 1 GiB
 export const MIGRATION_ABORTED_ERROR = "MIGRATION_ABORTED_BY_USER";
+const DEFAULT_FETCH_TIMEOUT_MS = 90_000;
+const FILE_TRANSFER_BASE_TIMEOUT_MS = 180_000;
+const FILE_TRANSFER_MAX_TIMEOUT_MS = 15 * 60 * 1000;
+const FILE_TRANSFER_TIMEOUT_PER_MB_MS = 2_500;
+const HEARTBEAT_LOG_INTERVAL_MS = 45_000;
 
 function asRecord(value: unknown): UnknownRecord | null {
   if (typeof value === "object" && value !== null) {
@@ -111,6 +121,35 @@ function randomToken(size = 16): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseSizeBytes(size: string | number | undefined): number | undefined {
+  if (typeof size === "number") {
+    return Number.isFinite(size) && size >= 0 ? size : undefined;
+  }
+  if (typeof size === "string") {
+    const normalized = size.replace(/,/g, "").trim();
+    if (!normalized) return undefined;
+    const parsed = Number(normalized);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return parsed;
+    }
+  }
+  return undefined;
+}
+
+function computeTransferTimeoutMs(sizeBytes?: number): number {
+  if (!sizeBytes || sizeBytes <= 0) {
+    return FILE_TRANSFER_BASE_TIMEOUT_MS;
+  }
+  const sizeMb = sizeBytes / (1024 * 1024);
+  const dynamic = FILE_TRANSFER_BASE_TIMEOUT_MS + Math.ceil(sizeMb) * FILE_TRANSFER_TIMEOUT_PER_MB_MS;
+  return Math.max(FILE_TRANSFER_BASE_TIMEOUT_MS, Math.min(FILE_TRANSFER_MAX_TIMEOUT_MS, dynamic));
+}
+
+function formatSizeMiB(sizeBytes?: number): string {
+  if (!sizeBytes || sizeBytes <= 0) return "taille inconnue";
+  return `${Math.round((sizeBytes / 1024 / 1024) * 10) / 10} MiB`;
 }
 
 function formatFetchError(url: string, error: unknown): string {
@@ -166,21 +205,34 @@ function parseWordPressConfigFromSoftaculous(
   };
 }
 
-async function fetchInsecure(url: string, init?: RequestInit): Promise<Response> {
+async function fetchInsecure(
+  url: string,
+  init?: RequestInit,
+  options?: FetchInsecureOptions,
+): Promise<Response> {
   const previous = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-  const attempts = 3;
+  const attempts = Math.max(1, options?.attempts ?? 3);
+  const timeoutMs = Math.max(5_000, options?.timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS);
   let lastError: unknown = null;
   try {
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(`timeout ${timeoutMs}ms`), timeoutMs);
       try {
-        return await fetch(url, init);
+        return await fetch(url, { ...init, signal: controller.signal });
       } catch (error: unknown) {
-        lastError = error;
+        const isTimeout = controller.signal.aborted;
+        const reason = isTimeout ? `timeout ${timeoutMs}ms` : error instanceof Error ? error.message : "fetch failed";
+        lastError = new Error(`Tentative ${attempt}/${attempts}: ${reason}`, {
+          cause: error instanceof Error ? error : undefined,
+        });
         if (attempt < attempts) {
           await sleep(250 * attempt);
           continue;
         }
+      } finally {
+        clearTimeout(timer);
       }
     }
     throw new Error(formatFetchError(url, lastError), {
@@ -275,11 +327,16 @@ function toViewerPath(absolutePath: string): string {
   return encodeURIComponent(absolutePath).replace(/%2F/g, "%2f");
 }
 
-async function downloadSourceFile(session: SessionContext, absolutePath: string): Promise<ArrayBuffer> {
+async function downloadSourceFile(
+  session: SessionContext,
+  absolutePath: string,
+  expectedSizeBytes?: number,
+): Promise<ArrayBuffer> {
   const viewerPath = toViewerPath(absolutePath);
+  const timeoutMs = computeTransferTimeoutMs(expectedSizeBytes);
   const res = await fetchInsecure(`${session.baseUrl}/viewer/${viewerPath}`, {
     headers: { Cookie: session.cookie },
-  });
+  }, { timeoutMs });
   if (!res.ok) {
     throw new Error(`Lecture source impossible (${absolutePath})`);
   }
@@ -291,6 +348,7 @@ async function uploadDestinationFile(
   destinationDir: string,
   fileName: string,
   content: BlobPart,
+  expectedSizeBytes?: number,
 ): Promise<void> {
   const normalizedDir = normalizeDirPath(destinationDir);
   const homePrefix = `/home/${session.user}`;
@@ -331,13 +389,14 @@ async function uploadDestinationFile(
   ];
 
   const strategyErrors: string[] = [];
+  const timeoutMs = computeTransferTimeoutMs(expectedSizeBytes);
   for (const strategy of strategies) {
     try {
       const res = await fetchInsecure(strategy.endpoint, {
         method: "POST",
         headers: { Cookie: session.cookie },
         body: strategy.form,
-      });
+      }, { timeoutMs });
       const text = await res.text();
       let parsed: UnknownRecord | null = null;
       try {
@@ -837,11 +896,22 @@ export async function runWordPressCrossAccountCloneFallback(
   let copiedFiles = 0;
   let copiedDirectories = 0;
   let copiedBytes = 0;
+  let lastHeartbeatAt = Date.now();
+  const logProgress = async (message: string) => {
+    await onLog?.(message);
+    lastHeartbeatAt = Date.now();
+  };
 
   while (stack.length > 0) {
     await throwIfAborted(control);
     const current = stack.pop();
     if (!current) break;
+
+    if (Date.now() - lastHeartbeatAt >= HEARTBEAT_LOG_INTERVAL_MS) {
+      await logProgress(
+        `Progression en cours: ${copiedFiles} fichiers (${Math.round((copiedBytes / 1024 / 1024) * 10) / 10} MiB), ${copiedDirectories} dossiers`,
+      );
+    }
 
     const entries = await listDirectoryEntries(sourceSession, current.sourceDir);
     for (const entry of entries) {
@@ -864,7 +934,7 @@ export async function runWordPressCrossAccountCloneFallback(
         });
         copiedDirectories += 1;
         if (copiedDirectories % 50 === 0) {
-          await onLog?.(`Dossiers copiés: ${copiedDirectories}`);
+          await logProgress(`Dossiers copiés: ${copiedDirectories}`);
         }
         continue;
       }
@@ -878,14 +948,25 @@ export async function runWordPressCrossAccountCloneFallback(
         throw new Error("Limite de sécurité atteinte: 1 GiB de fichiers");
       }
 
-      const content = await downloadSourceFile(sourceSession, entry.fullpath);
-      await uploadDestinationFile(destinationSession, current.destinationDir, entry.file, content);
+      const entrySizeBytes = parseSizeBytes(entry.size);
+      if (Date.now() - lastHeartbeatAt >= HEARTBEAT_LOG_INTERVAL_MS) {
+        await logProgress(`Copie en cours: ${relative} (${formatSizeMiB(entrySizeBytes)})`);
+      }
+
+      const content = await downloadSourceFile(sourceSession, entry.fullpath, entrySizeBytes);
+      await uploadDestinationFile(
+        destinationSession,
+        current.destinationDir,
+        entry.file,
+        content,
+        content.byteLength || entrySizeBytes,
+      );
 
       copiedFiles += 1;
       copiedBytes += content.byteLength;
 
       if (copiedFiles % 100 === 0) {
-        await onLog?.(
+        await logProgress(
           `Fichiers copiés: ${copiedFiles} (${Math.round((copiedBytes / 1024 / 1024) * 10) / 10} MiB)`,
         );
       }
@@ -910,7 +991,11 @@ export async function runWordPressCrossAccountCloneFallback(
 
     const sourceUrlBase = input.sourceUrl.replace(/\/+$/, "");
     const triggerUrl = `${sourceUrlBase}/${scriptFileName}?token=${encodeURIComponent(scriptToken)}`;
-    const triggerResponse = await fetchInsecure(triggerUrl);
+    const triggerResponse = await fetchInsecure(
+      triggerUrl,
+      undefined,
+      { timeoutMs: 20 * 60 * 1000, attempts: 1 },
+    );
     const triggerText = await triggerResponse.text();
     let triggerJson: UnknownRecord | null = null;
     try {
