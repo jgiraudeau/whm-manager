@@ -7,6 +7,36 @@ interface WhmConfig {
     token: string;
 }
 
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function describeFetchError(url: string, error: unknown): string {
+    if (!(error instanceof Error)) {
+        return `fetch failed (${url})`;
+    }
+
+    const cause = (error as Error & { cause?: unknown }).cause;
+    let details = error.message || "fetch failed";
+    if (cause && typeof cause === "object") {
+        const record = cause as Record<string, unknown>;
+        const code = typeof record.code === "string" ? record.code : "";
+        const hostname = typeof record.hostname === "string" ? record.hostname : "";
+        if (code && hostname) {
+            details = `${details} (${code} ${hostname})`;
+        } else if (code) {
+            details = `${details} (${code})`;
+        }
+    }
+
+    try {
+        const parsed = new URL(url);
+        return `${details} [${parsed.host}]`;
+    } catch {
+        return details;
+    }
+}
+
 function getWhmConfig(): WhmConfig {
     const host = process.env.WHM_HOST;
     const user = process.env.WHM_USER;
@@ -26,8 +56,23 @@ function getWhmConfig(): WhmConfig {
 async function fetchInsecure(url: string, init?: RequestInit): Promise<Response> {
     const prev = process.env.NODE_TLS_REJECT_UNAUTHORIZED;
     process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+    const attempts = 4;
+    let lastError: unknown = null;
     try {
-        return await fetch(url, init);
+        for (let attempt = 1; attempt <= attempts; attempt += 1) {
+            try {
+                return await fetch(url, init);
+            } catch (error: unknown) {
+                lastError = error;
+                if (attempt < attempts) {
+                    await sleep(250 * attempt);
+                    continue;
+                }
+            }
+        }
+        throw new Error(describeFetchError(url, lastError), {
+            cause: lastError instanceof Error ? lastError : undefined,
+        });
     } finally {
         if (prev === undefined) {
             delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
@@ -147,32 +192,46 @@ export async function getCPanelLoginURL(user: string): Promise<string | null> {
  * Creates a cPanel session and returns full data including the real cpsession cookie
  */
 export async function getCPanelSessionData(user: string) {
-    const data = await whmFetch("create_user_session", {
-        user,
-        service: "cpaneld",
-    });
-    const url = data?.data?.url;
-    if (!url) throw new Error("Impossible de créer une session cPanel");
+    let lastError: unknown = null;
+    const attempts = 3;
 
-    // Hit the login URL to get the real cpsession cookie from cPanel
-    const loginResp = await fetchInsecure(url, { redirect: "manual" });
-    const setCookieHeader = loginResp.headers.get("set-cookie");
-    let cookie = "";
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        try {
+            const data = await whmFetch("create_user_session", {
+                user,
+                service: "cpaneld",
+            });
+            const url = data?.data?.url;
+            if (!url) throw new Error("Impossible de créer une session cPanel");
 
-    if (setCookieHeader) {
-        const cookies = setCookieHeader.split(", ").map(c => c.split(";")[0]);
-        const cpsessionCookie = cookies.find(c => c.startsWith("cpsession="));
-        if (cpsessionCookie) {
-            cookie = cpsessionCookie;
+            // Hit the login URL to get the real cpsession cookie from cPanel
+            const loginResp = await fetchInsecure(url, { redirect: "manual" });
+            const setCookieHeader = loginResp.headers.get("set-cookie");
+            let cookie = "";
+
+            if (setCookieHeader) {
+                const cookies = setCookieHeader.split(", ").map(c => c.split(";")[0]);
+                const cpsessionCookie = cookies.find(c => c.startsWith("cpsession="));
+                if (cpsessionCookie) {
+                    cookie = cpsessionCookie;
+                }
+            }
+
+            const match = url.match(/\/cpsess\d+\//);
+            const cpsess = match ? match[0].replace(/\//g, "") : "";
+            const session = data?.data?.session;
+            const host = url.split("/")[2].split(":")[0];
+
+            return { url, session, cpsess, host, cookie };
+        } catch (error: unknown) {
+            lastError = error;
+            if (attempt < attempts) {
+                await sleep(300 * attempt);
+                continue;
+            }
         }
     }
-
-    const match = url.match(/\/cpsess\d+\//);
-    const cpsess = match ? match[0].replace(/\//g, "") : "";
-    const session = data?.data?.session;
-    const host = url.split("/")[2].split(":")[0];
-
-    return { url, session, cpsess, host, cookie };
+    throw new Error(`Impossible de créer une session cPanel pour ${user}: ${describeFetchError(getWhmConfig().host, lastError)}`);
 }
 
 // Get AutoSSL status for a user
