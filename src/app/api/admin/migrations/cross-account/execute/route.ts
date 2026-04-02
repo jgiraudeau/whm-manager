@@ -7,7 +7,10 @@ import {
   type CrossAccountMigrationPlan,
 } from "@/lib/migration-store";
 import { triggerSoftaculousBackup } from "@/lib/softaculous-client";
-import { runWordPressCrossAccountCloneFallback } from "@/lib/cross-account-wordpress-fallback";
+import {
+  MIGRATION_ABORTED_ERROR,
+  runWordPressCrossAccountCloneFallback,
+} from "@/lib/cross-account-wordpress-fallback";
 
 interface ExecuteBody {
   planId?: string;
@@ -51,6 +54,22 @@ function withStatus(
   return { ...plan, status };
 }
 
+function createStopChecker(planId: string): () => Promise<boolean> {
+  let lastCheckAt = 0;
+  let lastValue = false;
+
+  return async () => {
+    const now = Date.now();
+    if (now - lastCheckAt < 1200) {
+      return lastValue;
+    }
+    lastCheckAt = now;
+    const latest = await findMigrationById(planId);
+    lastValue = Boolean(latest?.execution?.stopRequestedAt);
+    return lastValue;
+  };
+}
+
 export async function POST(req: NextRequest) {
   const { denied, session } = await requireAuthSession(req);
   if (denied) return denied;
@@ -89,6 +108,10 @@ export async function POST(req: NextRequest) {
             startedAt: plan.execution?.startedAt ?? new Date().toISOString(),
             finishedAt: undefined,
             blockerReason: undefined,
+            fallbackSummary: undefined,
+            stopRequestedAt: undefined,
+            stoppedAt: undefined,
+            stoppedBy: undefined,
           },
         },
         `Exécution lancée par ${session.username}`,
@@ -97,8 +120,10 @@ export async function POST(req: NextRequest) {
     if (!runningPlan) {
       return NextResponse.json({ error: "Plan de migration introuvable" }, { status: 404 });
     }
+    const isStopRequested = createStopChecker(planId);
 
     const appendLog = async (message: string) => {
+      if (await isStopRequested()) return;
       await updateMigrationById(planId, (plan) => appendExecutionLog(plan, message));
     };
 
@@ -106,6 +131,30 @@ export async function POST(req: NextRequest) {
       runningPlan.sourceAccount,
       runningPlan.sourceInstallationId,
     );
+
+    if (await isStopRequested()) {
+      const stopped = await updateMigrationById(planId, (plan) => {
+        const withLog = appendExecutionLog(plan, "Exécution interrompue avant la phase backup/restore");
+        return {
+          ...withStatus(withLog, "blocked"),
+          execution: {
+            ...(withLog.execution ?? { logs: [] }),
+            backupTriggered: false,
+            backupMessage: backupResult.message,
+            fallbackUsed: false,
+            fallbackSummary: "Exécution interrompue manuellement",
+            blockerReason: withLog.execution?.blockerReason ?? "Interrompu manuellement",
+            finishedAt: withLog.execution?.finishedAt ?? new Date().toISOString(),
+          },
+        };
+      });
+      return NextResponse.json({
+        success: true,
+        stopped: true,
+        message: "Exécution arrêtée",
+        plan: stopped,
+      });
+    }
 
     if (!backupResult.success) {
       if (backupRestoreDisabled(backupResult.message) && runningPlan.sourceApp === "wordpress") {
@@ -123,9 +172,34 @@ export async function POST(req: NextRequest) {
                 targetUrl: runningPlan.targetUrl,
               },
               async (message) => {
+                if (await isStopRequested()) {
+                  throw new Error(MIGRATION_ABORTED_ERROR);
+                }
                 await appendLog(message);
               },
+              {
+                shouldAbort: isStopRequested,
+              },
             );
+
+            if (await isStopRequested()) {
+              await updateMigrationById(planId, (plan) => {
+                const withLog = appendExecutionLog(plan, "Exécution interrompue avant finalisation");
+                return {
+                  ...withStatus(withLog, "blocked"),
+                  execution: {
+                    ...(withLog.execution ?? { logs: [] }),
+                    backupTriggered: false,
+                    backupMessage: backupResult.message,
+                    fallbackUsed: true,
+                    fallbackSummary: "Exécution interrompue manuellement",
+                    blockerReason: withLog.execution?.blockerReason ?? "Interrompu manuellement",
+                    finishedAt: withLog.execution?.finishedAt ?? new Date().toISOString(),
+                  },
+                };
+              });
+              return;
+            }
 
             await updateMigrationById(planId, (plan) => {
               const withLog = appendExecutionLog(
@@ -152,6 +226,27 @@ export async function POST(req: NextRequest) {
               };
             });
           } catch (fallbackError: unknown) {
+            const abortedByUser =
+              fallbackError instanceof Error && fallbackError.message === MIGRATION_ABORTED_ERROR;
+            if (abortedByUser || (await isStopRequested())) {
+              await updateMigrationById(planId, (plan) => {
+                const withLog = appendExecutionLog(plan, "Exécution interrompue par l'administrateur");
+                return {
+                  ...withStatus(withLog, "blocked"),
+                  execution: {
+                    ...(withLog.execution ?? { logs: [] }),
+                    backupTriggered: false,
+                    backupMessage: backupResult.message,
+                    fallbackUsed: true,
+                    fallbackSummary: "Exécution interrompue manuellement",
+                    blockerReason: withLog.execution?.blockerReason ?? "Interrompu manuellement",
+                    finishedAt: withLog.execution?.finishedAt ?? new Date().toISOString(),
+                  },
+                };
+              });
+              return;
+            }
+
             const fallbackMessage = describeUnknownError(fallbackError)
               || safeError(
                 fallbackError,

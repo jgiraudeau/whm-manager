@@ -25,6 +25,10 @@ interface FallbackCloneInput {
   targetUrl: string;
 }
 
+interface FallbackRuntimeControl {
+  shouldAbort?: () => Promise<boolean> | boolean;
+}
+
 interface DbProvisioningResult {
   database: string;
   user: string;
@@ -68,6 +72,7 @@ const SKIP_RELATIVE_PREFIXES = [
 
 const MAX_FILES_TO_COPY = 6000;
 const MAX_BYTES_TO_COPY = 1024 * 1024 * 1024; // 1 GiB
+export const MIGRATION_ABORTED_ERROR = "MIGRATION_ABORTED_BY_USER";
 
 function asRecord(value: unknown): UnknownRecord | null {
   if (typeof value === "object" && value !== null) {
@@ -423,6 +428,13 @@ function generateDbPassword(): string {
   return Array.from(bytes, (b) => chars[b % chars.length]).join("");
 }
 
+async function throwIfAborted(control?: FallbackRuntimeControl): Promise<void> {
+  const shouldAbort = await control?.shouldAbort?.();
+  if (shouldAbort) {
+    throw new Error(MIGRATION_ABORTED_ERROR);
+  }
+}
+
 async function createDestinationDatabase(
   session: SessionContext,
   hint: string,
@@ -727,7 +739,9 @@ async function removeTemporaryScript(sourceAccount: string, sourcePath: string, 
 export async function runWordPressCrossAccountCloneFallback(
   input: FallbackCloneInput,
   onLog?: (message: string) => Promise<void> | void,
+  control?: FallbackRuntimeControl,
 ): Promise<WordPressFallbackCloneResult> {
+  await throwIfAborted(control);
   await onLog?.("Fallback: chargement des installations source");
   const sourceInstallations = await listSoftaculousInstallationsForUser(input.sourceAccount);
   const sourceInstallation = resolveSourceInstallation(sourceInstallations, input.sourceInstallationId);
@@ -747,10 +761,12 @@ export async function runWordPressCrossAccountCloneFallback(
     await resolveDestinationDocumentRoot(input.destinationAccount, targetHost, input.destinationSubdomain),
   );
 
+  await throwIfAborted(control);
   await onLog?.("Fallback: ouverture des sessions cPanel source/destination");
   const sourceSession = await createSessionContext(input.sourceAccount);
   const destinationSession = await createSessionContext(input.destinationAccount);
 
+  await throwIfAborted(control);
   await ensureDirectory(input.destinationAccount, destinationPath);
   await onLog?.(`Fallback phase 2 activé (WordPress): ${sourcePath} -> ${destinationPath}`);
 
@@ -763,11 +779,13 @@ export async function runWordPressCrossAccountCloneFallback(
   let copiedBytes = 0;
 
   while (stack.length > 0) {
+    await throwIfAborted(control);
     const current = stack.pop();
     if (!current) break;
 
     const entries = await listDirectoryEntries(sourceSession, current.sourceDir);
     for (const entry of entries) {
+      await throwIfAborted(control);
       const relative = normalizeRelativePath(
         entry.fullpath.startsWith(`${sourcePath}/`)
           ? entry.fullpath.slice(sourcePath.length + 1)
@@ -814,6 +832,7 @@ export async function runWordPressCrossAccountCloneFallback(
     }
   }
 
+  await throwIfAborted(control);
   const sourceDb = parseWordPressConfigFromSoftaculous(sourceInstallation);
   const destinationDb = await createDestinationDatabase(destinationSession, input.destinationSubdomain);
   await onLog?.(`Base destination créée: ${destinationDb.database}`);
@@ -824,6 +843,7 @@ export async function runWordPressCrossAccountCloneFallback(
 
   let scriptUploaded = false;
   try {
+    await throwIfAborted(control);
     await uploadDestinationFile(sourceSession, sourcePath, scriptFileName, Buffer.from(scriptContent, "utf8"));
     scriptUploaded = true;
     await onLog?.("Script de duplication DB déployé sur la source");
@@ -846,6 +866,7 @@ export async function runWordPressCrossAccountCloneFallback(
       throw new Error(`Duplication DB échouée: ${errorMessage}`);
     }
 
+    await throwIfAborted(control);
     await onLog?.("Duplication DB source -> destination terminée");
 
     await updateDestinationWpConfig(destinationSession, destinationPath, destinationDb, sourceDb.host || "localhost");

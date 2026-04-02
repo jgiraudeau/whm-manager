@@ -10,6 +10,8 @@ import {
   RefreshCw,
   GitBranchPlus,
   PlayCircle,
+  Square,
+  Trash2,
 } from "lucide-react";
 
 interface AccountItem {
@@ -48,6 +50,9 @@ interface MigrationPlan {
     blockerReason?: string;
     fallbackUsed?: boolean;
     fallbackSummary?: string;
+    stopRequestedAt?: string;
+    stoppedAt?: string;
+    stoppedBy?: string;
     logs?: string[];
   };
 }
@@ -66,6 +71,9 @@ export default function AdminMigrationsPage() {
   const [installationsLoading, setInstallationsLoading] = useState(false);
   const [preparing, setPreparing] = useState(false);
   const [executingId, setExecutingId] = useState("");
+  const [stoppingId, setStoppingId] = useState("");
+  const [deletingId, setDeletingId] = useState("");
+  const [clearingAll, setClearingAll] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [preparedPlan, setPreparedPlan] = useState<MigrationPlan | null>(null);
@@ -187,8 +195,12 @@ export default function AdminMigrationsPage() {
     }
   }, [plans, preparedPlan]);
 
+  const hasRunningPlan = useMemo(
+    () => plans.some((plan) => plan.status === "running"),
+    [plans],
+  );
+
   useEffect(() => {
-    const hasRunningPlan = plans.some((plan) => plan.status === "running");
     if (!hasRunningPlan) return;
 
     const timer = window.setInterval(() => {
@@ -196,7 +208,7 @@ export default function AdminMigrationsPage() {
     }, 4000);
 
     return () => window.clearInterval(timer);
-  }, [plans, refreshPlans]);
+  }, [hasRunningPlan, refreshPlans]);
 
   async function prepareMigration() {
     if (!sourceAccount || !sourceRef || !destinationAccount || !destinationSubdomain || !destinationDomain) {
@@ -266,6 +278,87 @@ export default function AdminMigrationsPage() {
       setError(err instanceof Error ? err.message : "Erreur d'exécution");
     } finally {
       setExecutingId("");
+    }
+  }
+
+  async function stopPlan(planId: string) {
+    setStoppingId(planId);
+    setError("");
+    setMessage("");
+    try {
+      const res = await fetch("/api/admin/migrations/cross-account/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ planId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.error) {
+        throw new Error(data.error ?? "Impossible d'arrêter la tentative");
+      }
+
+      const plan = data.plan as MigrationPlan | undefined;
+      if (plan) {
+        setPreparedPlan((prev) => (prev?.id === plan.id ? plan : prev));
+      }
+      setMessage(data.message ?? "Arrêt demandé");
+      await refreshPlans();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Erreur d'arrêt");
+    } finally {
+      setStoppingId("");
+    }
+  }
+
+  async function deletePlan(planId: string) {
+    if (!window.confirm("Supprimer cette tentative de migration ?")) return;
+    setDeletingId(planId);
+    setError("");
+    setMessage("");
+    try {
+      const res = await fetch(
+        `/api/admin/migrations/cross-account?planId=${encodeURIComponent(planId)}`,
+        { method: "DELETE" },
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.error) {
+        throw new Error(data.error ?? "Impossible de supprimer la tentative");
+      }
+
+      setPreparedPlan((prev) => (prev?.id === planId ? null : prev));
+      setMessage(data.message ?? "Tentative supprimée");
+      await refreshPlans();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Erreur de suppression");
+    } finally {
+      setDeletingId("");
+    }
+  }
+
+  async function clearPlansHistory() {
+    if (!window.confirm("Supprimer tout l'historique des tentatives ?")) return;
+    setClearingAll(true);
+    setError("");
+    setMessage("");
+    try {
+      const res = await fetch("/api/admin/migrations/cross-account?all=1", {
+        method: "DELETE",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.error) {
+        throw new Error(data.error ?? "Impossible de vider l'historique");
+      }
+
+      setPreparedPlan((prev) => {
+        if (!prev) return prev;
+        const stillThere = plans.some((plan) => plan.id === prev.id && plan.status === "running");
+        return stillThere ? prev : null;
+      });
+      setMessage(data.message ?? "Historique vidé");
+      await refreshPlans();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Erreur de suppression globale");
+    } finally {
+      setClearingAll(false);
     }
   }
 
@@ -484,6 +577,11 @@ export default function AdminMigrationsPage() {
                     <span className="text-red-400">Blocage:</span> {preparedPlan.execution.blockerReason}
                   </p>
                 )}
+                {preparedPlan.execution?.stoppedBy && (
+                  <p className="text-amber-300">
+                    <span className="text-amber-400">Arrêt:</span> demandé par {preparedPlan.execution.stoppedBy}
+                  </p>
+                )}
                 <div>
                   <p className="text-gray-500 mb-1">Vérifications</p>
                   <ul className="space-y-1">
@@ -510,20 +608,62 @@ export default function AdminMigrationsPage() {
                     </div>
                   </div>
                 )}
-                <button
-                  onClick={() => void executePlan(preparedPlan.id)}
-                  disabled={executingId === preparedPlan.id || preparedPlan.status === "running"}
-                  className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg text-sm font-semibold flex items-center justify-center gap-2"
-                >
-                  {executingId === preparedPlan.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <PlayCircle className="w-4 h-4" />}
-                  {executingId === preparedPlan.id ? "Exécution…" : "Lancer phase 2"}
-                </button>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={() => void executePlan(preparedPlan.id)}
+                    disabled={
+                      executingId === preparedPlan.id
+                      || stoppingId === preparedPlan.id
+                      || preparedPlan.status === "running"
+                    }
+                    className="flex-1 min-w-[180px] py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg text-sm font-semibold flex items-center justify-center gap-2"
+                  >
+                    {executingId === preparedPlan.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <PlayCircle className="w-4 h-4" />}
+                    {executingId === preparedPlan.id ? "Exécution…" : "Lancer phase 2"}
+                  </button>
+
+                  <button
+                    onClick={() => void stopPlan(preparedPlan.id)}
+                    disabled={
+                      preparedPlan.status !== "running"
+                      || stoppingId === preparedPlan.id
+                      || deletingId === preparedPlan.id
+                    }
+                    className="px-4 py-2.5 bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white rounded-lg text-sm font-semibold flex items-center justify-center gap-2"
+                  >
+                    {stoppingId === preparedPlan.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Square className="w-4 h-4" />}
+                    Arrêter
+                  </button>
+
+                  <button
+                    onClick={() => void deletePlan(preparedPlan.id)}
+                    disabled={
+                      preparedPlan.status === "running"
+                      || deletingId === preparedPlan.id
+                      || stoppingId === preparedPlan.id
+                    }
+                    className="px-4 py-2.5 bg-red-700/90 hover:bg-red-600 disabled:opacity-40 text-white rounded-lg text-sm font-semibold flex items-center justify-center gap-2"
+                  >
+                    {deletingId === preparedPlan.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                    Supprimer
+                  </button>
+                </div>
               </div>
             )}
           </div>
 
           <div className="bg-gray-900 border border-gray-800 rounded-xl p-5">
-            <h2 className="text-sm font-semibold text-white mb-3">Historique des plans</h2>
+            <div className="flex items-center justify-between gap-2 mb-3">
+              <h2 className="text-sm font-semibold text-white">Historique des plans</h2>
+              <button
+                onClick={() => void clearPlansHistory()}
+                disabled={plans.length === 0 || hasRunningPlan || clearingAll}
+                className="px-3 py-1.5 rounded-md bg-red-700/80 hover:bg-red-600 disabled:opacity-40 text-white text-xs font-semibold flex items-center gap-1.5"
+              >
+                {clearingAll ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+                Vider
+              </button>
+            </div>
             {plans.length === 0 ? (
               <p className="text-sm text-gray-500">Aucun plan enregistré.</p>
             ) : (
@@ -546,13 +686,29 @@ export default function AdminMigrationsPage() {
                         <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold uppercase ${statusBadge(plan.status)}`}>
                           {plan.status}
                         </span>
-                        <button
-                          onClick={() => void executePlan(plan.id)}
-                          disabled={executingId === plan.id || plan.status === "running"}
-                          className="px-2.5 py-1 rounded-md bg-indigo-600/90 hover:bg-indigo-500 disabled:opacity-40 text-white text-[11px] font-semibold"
-                        >
-                          {executingId === plan.id ? "Exécution…" : "Exécuter"}
-                        </button>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            onClick={() => void executePlan(plan.id)}
+                            disabled={executingId === plan.id || plan.status === "running"}
+                            className="px-2.5 py-1 rounded-md bg-indigo-600/90 hover:bg-indigo-500 disabled:opacity-40 text-white text-[11px] font-semibold"
+                          >
+                            {executingId === plan.id ? "Exécution…" : "Exécuter"}
+                          </button>
+                          <button
+                            onClick={() => void stopPlan(plan.id)}
+                            disabled={plan.status !== "running" || stoppingId === plan.id}
+                            className="px-2.5 py-1 rounded-md bg-amber-600/90 hover:bg-amber-500 disabled:opacity-40 text-white text-[11px] font-semibold"
+                          >
+                            {stoppingId === plan.id ? "Arrêt…" : "Arrêter"}
+                          </button>
+                          <button
+                            onClick={() => void deletePlan(plan.id)}
+                            disabled={plan.status === "running" || deletingId === plan.id}
+                            className="px-2.5 py-1 rounded-md bg-red-700/90 hover:bg-red-600 disabled:opacity-40 text-white text-[11px] font-semibold"
+                          >
+                            {deletingId === plan.id ? "Suppression…" : "Supprimer"}
+                          </button>
+                        </div>
                       </div>
                     </div>
                   </div>

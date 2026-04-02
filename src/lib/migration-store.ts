@@ -12,6 +12,9 @@ export interface MigrationExecutionState {
   blockerReason?: string;
   fallbackUsed?: boolean;
   fallbackSummary?: string;
+  stopRequestedAt?: string;
+  stoppedAt?: string;
+  stoppedBy?: string;
   logs: string[];
 }
 
@@ -88,6 +91,10 @@ function normalizePlan(raw: unknown): CrossAccountMigrationPlan | null {
         fallbackUsed: Boolean(executionInput.fallbackUsed),
         fallbackSummary:
           typeof executionInput.fallbackSummary === "string" ? executionInput.fallbackSummary : undefined,
+        stopRequestedAt:
+          typeof executionInput.stopRequestedAt === "string" ? executionInput.stopRequestedAt : undefined,
+        stoppedAt: typeof executionInput.stoppedAt === "string" ? executionInput.stoppedAt : undefined,
+        stoppedBy: typeof executionInput.stoppedBy === "string" ? executionInput.stoppedBy : undefined,
         logs: Array.isArray(executionInput.logs)
           ? executionInput.logs.filter((item): item is string => typeof item === "string")
           : [],
@@ -193,6 +200,24 @@ export async function updateMigrationById(
   store.plans[index] = updated;
   await writeStore(store);
   return updated;
+}
+
+export async function deleteMigrationById(id: string): Promise<CrossAccountMigrationPlan | null> {
+  const store = await readStore();
+  const index = store.plans.findIndex((plan) => plan.id === id);
+  if (index === -1) return null;
+
+  const [removed] = store.plans.splice(index, 1);
+  await writeStore(store);
+  return removed ?? null;
+}
+
+export async function clearMigrations(): Promise<number> {
+  const store = await readStore();
+  const removedCount = store.plans.length;
+  store.plans = [];
+  await writeStore(store);
+  return removedCount;
 }
 
 export function appendExecutionLog(
