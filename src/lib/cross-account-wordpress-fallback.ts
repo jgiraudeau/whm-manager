@@ -915,18 +915,48 @@ export async function runWordPressCrossAccountCloneFallback(
   await ensureDirectory(input.destinationAccount, destinationPath);
   await onLog?.(`Fallback phase 2 activé (WordPress): ${sourcePath} -> ${destinationPath}`);
 
-  const sourceRelativeDir = sourcePath.replace(new RegExp(`^/home/${input.sourceAccount}/`), "");
+  await onLog?.("Analyse sélective du contenu pour ignorer les lourds dossiers de cache et backups...");
+  const rootEntries = await listDirectoryEntries(sourceSession, sourcePath);
+  const selectedPaths: string[] = [];
+
+  for (const entry of rootEntries) {
+     if (entry.file === "." || entry.file === "..") continue;
+     // Exclude giant archives often left at root
+     if (entry.file.endsWith(".zip") || entry.file.endsWith(".tar.gz") || entry.file.endsWith(".sql")) continue;
+     if (entry.file === "wp-snapshots" || entry.file === ".cache") continue;
+
+     if (entry.file === "wp-content" && entry.type === "dir") {
+         const wpContentEntries = await listDirectoryEntries(sourceSession, entry.fullpath);
+         for (const wcEntry of wpContentEntries) {
+             if (wcEntry.file === "." || wcEntry.file === "..") continue;
+             if (wcEntry.file.endsWith(".zip") || wcEntry.file.endsWith(".tar.gz") || wcEntry.file.endsWith(".sql")) continue;
+             
+             // Crucial: SKIP heavy junk folders
+             const skipFolders = ["cache", "updraft", "backups", "upgrade", "wflogs", "wprfc", "debug.log", "et-cache", "litespeed"];
+             if (skipFolders.includes(wcEntry.file.toLowerCase())) continue;
+             
+             selectedPaths.push(wcEntry.fullpath);
+         }
+     } else {
+         selectedPaths.push(entry.fullpath);
+     }
+  }
+
+  const sourceRelativePaths = selectedPaths.map(p => p.replace(new RegExp(`^/home/${input.sourceAccount}/`), ""));
+  const sourceRelativeDir = sourcePath.replace(new RegExp(`^/home/${input.sourceAccount}/`), ""); // Keep for wrapper reference
   const tempZipName = `mgr_fallback_${randomToken(6)}.zip`;
 
-  let copiedFiles = 1;
+  let copiedFiles = selectedPaths.length; // Approximate
   let copiedDirectories = 1;
   let copiedBytes = 0;
 
-  await onLog?.("Compression cPanel: création de l'archive ZIP...");
+  await onLog?.("Compression cPanel: création de l'archive ZIP optimisée (sans cache/backup)...");
+  
+  // Perform chunked compression if needed, but usually ~50 items is totally fine for cPanel.
   const compressRes = await cpanelApi2(input.sourceAccount, "Fileman", "fileop", {
     op: "compress",
     metadata: "zip",
-    sourcefiles: sourceRelativeDir, 
+    sourcefiles: sourceRelativePaths.join(","), 
     destfiles: tempZipName, 
     doubledecode: "1"
   });
