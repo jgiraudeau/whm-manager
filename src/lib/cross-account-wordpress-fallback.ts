@@ -323,24 +323,37 @@ async function listDirectoryEntries(session: SessionContext, absoluteDir: string
   return out;
 }
 
-function toViewerPath(absolutePath: string): string {
-  return encodeURIComponent(absolutePath).replace(/%2F/g, "%2f");
-}
-
 async function downloadSourceFile(
   session: SessionContext,
   absolutePath: string,
   expectedSizeBytes?: number,
 ): Promise<ArrayBuffer> {
-  const viewerPath = toViewerPath(absolutePath);
+  // Use UAPI Fileman::get_file_content — returns base64 content, avoids viewer path encoding issues
   const timeoutMs = computeTransferTimeoutMs(expectedSizeBytes);
-  const res = await fetchInsecure(`${session.baseUrl}/viewer/${viewerPath}`, {
+  const url = new URL(`${session.baseUrl}/execute/Fileman/get_file_content`);
+  url.searchParams.set("file", absolutePath);
+  const res = await fetchInsecure(url.toString(), {
     headers: { Cookie: session.cookie },
   }, { timeoutMs });
   if (!res.ok) {
-    throw new Error(`Lecture source impossible (${absolutePath})`);
+    throw new Error(`Lecture source impossible (${absolutePath}) — HTTP ${res.status}`);
   }
-  return res.arrayBuffer();
+  const json = await res.json() as Record<string, unknown>;
+  const result = (json?.result ?? json) as Record<string, unknown>;
+  if (result?.status === 0 || result?.status === "0") {
+    const errs = Array.isArray(result?.errors) ? (result.errors as string[]) : [];
+    const msgs = Array.isArray(result?.messages) ? (result.messages as string[]) : [];
+    throw new Error(`Lecture source impossible (${absolutePath}) — ${errs[0] ?? msgs[0] ?? "erreur inconnue"}`);
+  }
+  const b64 = (result?.data as Record<string, unknown>)?.content as string ?? result?.content as string;
+  if (!b64) {
+    throw new Error(`Lecture source impossible (${absolutePath}) — contenu vide ou format inattendu`);
+  }
+  // Decode base64 to ArrayBuffer
+  const binary = atob(b64);
+  const buf = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) buf[i] = binary.charCodeAt(i);
+  return buf.buffer;
 }
 
 async function uploadDestinationFile(
@@ -953,8 +966,10 @@ export async function runWordPressCrossAccountCloneFallback(
   }
 
   const sourceRelativePaths = selectedPaths.map(p => p.replace(new RegExp(`^/home/${input.sourceAccount}/`), ""));
-  const sourceRelativeDir = sourcePath.replace(new RegExp(`^/home/${input.sourceAccount}/`), ""); // Keep for wrapper reference
+  const sourceRelativeDir = sourcePath.replace(new RegExp(`^/home/${input.sourceAccount}/`), ""); // e.g. "public_html/wp1"
   const tempZipName = `mgr_fallback_${randomToken(6)}.zip`;
+  // Always put the ZIP at account root (~) so the path is unambiguous and easy to download.
+  const destZipRelativePath = tempZipName;
 
   let copiedFiles = selectedPaths.length; // Approximate
   let copiedDirectories = 1;
@@ -967,7 +982,7 @@ export async function runWordPressCrossAccountCloneFallback(
     op: "compress",
     metadata: "zip",
     sourcefiles: sourceRelativePaths.join(","), 
-    destfiles: tempZipName, 
+    destfiles: destZipRelativePath, 
     dir: `/home/${input.sourceAccount}`,
     doubledecode: "1"
   });
@@ -977,7 +992,7 @@ export async function runWordPressCrossAccountCloneFallback(
   await onLog?.("Archive prête ! Téléchargement vers le noeud de migration...");
   const zipBuffer = await downloadSourceFile(
     sourceSession, 
-    `/home/${input.sourceAccount}/${tempZipName}`, 
+    `/home/${input.sourceAccount}/${destZipRelativePath}`, 
     250 * 1024 * 1024
   );
   await onLog?.(`Archive téléchargée (${formatSizeMiB(zipBuffer.byteLength)}). Transférée...`);
