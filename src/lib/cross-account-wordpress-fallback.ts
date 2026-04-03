@@ -362,6 +362,7 @@ async function uploadDestinationFile(
     const form = new FormData();
     if (includeDirField) {
       form.append("dir", relativeDir);
+      form.append("overwrite", "1");
     }
     form.append(fileField, new Blob([content]), fileName);
     return form;
@@ -383,53 +384,78 @@ async function uploadDestinationFile(
     {
       // Backward-compat with previous behavior.
       label: "query-dir+file",
-      endpoint: `${session.baseUrl}/execute/Fileman/upload_files?dir=${encodeURIComponent(normalizedDir)}`,
+      endpoint: `${session.baseUrl}/execute/Fileman/upload_files?dir=${encodeURIComponent(normalizedDir)}&overwrite=1`,
       form: buildForm("file", false),
     },
   ];
 
-  const strategyErrors: string[] = [];
   const timeoutMs = computeTransferTimeoutMs(expectedSizeBytes);
-  for (const strategy of strategies) {
-    try {
-      const res = await fetchInsecure(strategy.endpoint, {
-        method: "POST",
-        headers: { Cookie: session.cookie },
-        body: strategy.form,
-      }, { timeoutMs });
-      const text = await res.text();
-      let parsed: UnknownRecord | null = null;
+  
+  const executeStrategies = async () => {
+    const strategyErrors: string[] = [];
+    for (const strategy of strategies) {
       try {
-        parsed = JSON.parse(text) as UnknownRecord;
-      } catch {
-        parsed = null;
-      }
-      if (!parsed) {
-        throw new Error(`Réponse non JSON (HTTP ${res.status})`);
-      }
+        const res = await fetchInsecure(strategy.endpoint, {
+          method: "POST",
+          headers: { Cookie: session.cookie },
+          body: strategy.form,
+        }, { timeoutMs });
+        const text = await res.text();
+        let parsed: UnknownRecord | null = null;
+        try {
+          parsed = JSON.parse(text) as UnknownRecord;
+        } catch {
+          parsed = null;
+        }
+        if (!parsed) {
+          throw new Error(`Réponse non JSON (HTTP ${res.status})`);
+        }
 
-      const payload = asRecord(parsed.result) ?? parsed;
-      const statusValue = payload.status;
-      const isSuccess = statusValue === 1 || statusValue === "1" || statusValue === true;
-      if (!isSuccess) {
-        const errors = Array.isArray(payload.errors)
-          ? payload.errors.filter((item): item is string => typeof item === "string")
-          : [];
-        const messages = Array.isArray(payload.messages)
-          ? payload.messages.filter((item): item is string => typeof item === "string")
-          : [];
-        throw new Error(errors[0] ?? messages[0] ?? `status=${String(statusValue ?? "unknown")}`);
+        const payload = asRecord(parsed.result) ?? parsed;
+        const statusValue = payload.status;
+        const isSuccess = statusValue === 1 || statusValue === "1" || statusValue === true;
+        if (!isSuccess) {
+          const errors = Array.isArray(payload.errors)
+            ? payload.errors.filter((item): item is string => typeof item === "string")
+            : [];
+          const messages = Array.isArray(payload.messages)
+            ? payload.messages.filter((item): item is string => typeof item === "string")
+            : [];
+          throw new Error(errors[0] ?? messages[0] ?? `status=${String(statusValue ?? "unknown")}`);
+        }
+        
+        const payloadData = asRecord(payload.data);
+        if (Array.isArray(payloadData?.uploads)) {
+          for (const item of payloadData.uploads) {
+             const uploadResult = asRecord(item);
+             if (uploadResult?.status === 0 || uploadResult?.status === "0") {
+                 throw new Error(String(uploadResult.reason || "internal upload error"));
+             }
+          }
+        }
+
+        return;
+      } catch (error: unknown) {
+        const detail = error instanceof Error ? error.message : "erreur inconnue";
+        strategyErrors.push(`${strategy.label}: ${detail}`);
       }
-      return;
-    } catch (error: unknown) {
-      const detail = error instanceof Error ? error.message : "erreur inconnue";
-      strategyErrors.push(`${strategy.label}: ${detail}`);
     }
-  }
 
-  throw new Error(
-    `Upload échoué (${fileName}) vers ${relativeDir}: ${strategyErrors.join(" | ")}`.slice(0, 700),
-  );
+    throw new Error(
+      `Upload échoué (${fileName}) vers ${relativeDir}: ${strategyErrors.join(" | ")}`.slice(0, 700),
+    );
+  };
+
+  try {
+    await executeStrategies();
+  } catch (error) {
+    try {
+      await unlinkFile(session.user, `${normalizedDir}/${fileName}`);
+    } catch {
+      // ignore
+    }
+    await executeStrategies();
+  }
 }
 
 function parseApi2Error(data: unknown): string {
