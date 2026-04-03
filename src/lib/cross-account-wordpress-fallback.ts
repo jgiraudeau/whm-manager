@@ -996,17 +996,39 @@ export async function runWordPressCrossAccountCloneFallback(
   const compressErr = parseApi2Error(compressRes);
   if (compressErr) throw new Error(`cPanel Compress API2 erreur: ${compressErr}`);
 
+  // --- Locate the ZIP: scan possible locations cPanel might have put it ---
+  const candidateDirs = [
+    sourcePath,                                                          // most likely: inside wp1/
+    sourcePath.split("/").slice(0, -1).join("/") || `/home/${input.sourceAccount}`, // parent: public_html/
+    `/home/${input.sourceAccount}`,                                      // home root
+  ];
+  let foundZipPath: string | null = null;
+  for (const candidateDir of candidateDirs) {
+    try {
+      const entries = await listDirectoryEntries(sourceSession, candidateDir);
+      const match = entries.find(e => e.file === tempZipName);
+      if (match) {
+        foundZipPath = match.fullpath || `${candidateDir}/${tempZipName}`;
+        await onLog?.(`Archive trouvée dans: ${foundZipPath}`);
+        break;
+      }
+    } catch { /* dir may not exist, continue */ }
+  }
+  if (!foundZipPath) {
+    throw new Error(`Archive ZIP introuvable après compression (cherché dans: ${candidateDirs.join(", ")})`);
+  }
+
   await onLog?.("Archive prête ! Téléchargement vers le noeud de migration...");
   const zipBuffer = await downloadSourceFile(
     sourceSession, 
-    zipAbsolutePath,
+    foundZipPath,
     250 * 1024 * 1024
   );
   await onLog?.(`Archive téléchargée (${formatSizeMiB(zipBuffer.byteLength)}). Transfert en cours...`);
 
   // Clean up the temp zip from source server
   try {
-    await unlinkFile(input.sourceAccount, zipAbsolutePath);
+    await unlinkFile(input.sourceAccount, foundZipPath);
   } catch { /* ignore cleanup errors */ }
 
   await onLog?.("Envoi de l'archive vers le serveur de destination...");
