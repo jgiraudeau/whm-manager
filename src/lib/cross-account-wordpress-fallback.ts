@@ -915,89 +915,91 @@ export async function runWordPressCrossAccountCloneFallback(
   await ensureDirectory(input.destinationAccount, destinationPath);
   await onLog?.(`Fallback phase 2 activé (WordPress): ${sourcePath} -> ${destinationPath}`);
 
-  const stack: Array<{ sourceDir: string; destinationDir: string }> = [
-    { sourceDir: sourcePath, destinationDir: destinationPath },
-  ];
+  const sourceRelativeDir = sourcePath.replace(new RegExp(`^/home/${input.sourceAccount}/`), "");
+  const tempZipName = `mgr_fallback_${randomToken(6)}.zip`;
 
-  let copiedFiles = 0;
-  let copiedDirectories = 0;
+  let copiedFiles = 1;
+  let copiedDirectories = 1;
   let copiedBytes = 0;
-  let lastHeartbeatAt = Date.now();
-  const logProgress = async (message: string) => {
-    await onLog?.(message);
-    lastHeartbeatAt = Date.now();
-  };
 
-  while (stack.length > 0) {
-    await throwIfAborted(control);
-    const current = stack.pop();
-    if (!current) break;
+  await onLog?.("Compression cPanel: création de l'archive ZIP...");
+  const compressRes = await cpanelApi2(input.sourceAccount, "Fileman", "fileop", {
+    op: "compress",
+    metadata: "zip",
+    sourcefiles: sourceRelativeDir, 
+    destfiles: tempZipName, 
+    doubledecode: "1"
+  });
+  const compressErr = parseApi2Error(compressRes);
+  if (compressErr) throw new Error(`cPanel Compress API2 erreur: ${compressErr}`);
 
-    if (Date.now() - lastHeartbeatAt >= HEARTBEAT_LOG_INTERVAL_MS) {
-      await logProgress(
-        `Progression en cours: ${copiedFiles} fichiers (${Math.round((copiedBytes / 1024 / 1024) * 10) / 10} MiB), ${copiedDirectories} dossiers`,
-      );
-    }
+  await onLog?.("Archive prête ! Téléchargement vers le noeud de migration...");
+  const zipBuffer = await downloadSourceFile(
+    sourceSession, 
+    `/home/${input.sourceAccount}/${tempZipName}`, 
+    250 * 1024 * 1024
+  );
+  await onLog?.(`Archive téléchargée (${formatSizeMiB(zipBuffer.byteLength)}). Transférée...`);
 
-    const entries = await listDirectoryEntries(sourceSession, current.sourceDir);
-    for (const entry of entries) {
-      await throwIfAborted(control);
-      const relative = normalizeRelativePath(
-        entry.fullpath.startsWith(`${sourcePath}/`)
-          ? entry.fullpath.slice(sourcePath.length + 1)
-          : path.posix.basename(entry.fullpath),
-      );
-      if (shouldSkipRelative(relative)) {
-        continue;
+  await onLog?.("Envoi de l'archive vers le serveur de destination...");
+  await uploadDestinationFile(
+    destinationSession, 
+    destinationPath, 
+    tempZipName, 
+    zipBuffer, 
+    zipBuffer.byteLength
+  );
+  copiedBytes = zipBuffer.byteLength;
+
+  await onLog?.("Extraction cPanel: décompression de l'archive ZIP...");
+  const destRelativeDir = destinationPath.replace(new RegExp(`^/home/${input.destinationAccount}/`), ""); 
+  const extractRes = await cpanelApi2(input.destinationAccount, "Fileman", "fileop", {
+    op: "extract",
+    sourcefiles: `${destRelativeDir}/${tempZipName}`,
+    destfiles: destRelativeDir,
+    doubledecode: "1"
+  });
+  const extractErr = parseApi2Error(extractRes);
+  if (extractErr) throw new Error(`cPanel Extract API2 erreur: ${extractErr}`);
+
+  await onLog?.("Réorganisation des fichiers (déplacement du contenu)...");
+  const extractedFolderName = sourceRelativeDir.split('/').filter(Boolean).pop() || "";
+  const nestedDirPath = `${destinationPath}/${extractedFolderName}`;
+  const nestedEntries = await listDirectoryEntries(destinationSession, nestedDirPath);
+  
+  if (nestedEntries.length > 0) {
+      const moveFiles = nestedEntries
+         .filter(e => e.file !== "." && e.file !== "..")
+         .map(e => e.fullpath.replace(new RegExp(`^/home/${input.destinationAccount}/`), ""));
+         
+      const chunksize = 40; 
+      for (let i = 0; i < moveFiles.length; i += chunksize) {
+         const chunk = moveFiles.slice(i, i + chunksize);
+         await cpanelApi2(input.destinationAccount, "Fileman", "fileop", {
+             op: "move", 
+             sourcefiles: chunk.join(","),
+             destfiles: destRelativeDir,
+             doubledecode: "1"
+         });
       }
-
-      if (entry.type === "dir") {
-        const childDestination = `${current.destinationDir}/${entry.file}`;
-        await ensureDirectory(input.destinationAccount, childDestination);
-        stack.push({
-          sourceDir: entry.fullpath,
-          destinationDir: childDestination,
-        });
-        copiedDirectories += 1;
-        if (copiedDirectories % 50 === 0) {
-          await logProgress(`Dossiers copiés: ${copiedDirectories}`);
-        }
-        continue;
+      
+      try {
+         await cpanelApi2(input.destinationAccount, "Fileman", "fileop", {
+            op: "unlink", 
+            sourcefiles: `${destRelativeDir}/${extractedFolderName}`
+         });
+      } catch {
+         // clean-up ignore
       }
-
-      if (entry.type !== "file") continue;
-
-      if (copiedFiles >= MAX_FILES_TO_COPY) {
-        throw new Error(`Limite de sécurité atteinte: ${MAX_FILES_TO_COPY} fichiers`);
-      }
-      if (copiedBytes >= MAX_BYTES_TO_COPY) {
-        throw new Error("Limite de sécurité atteinte: 1 GiB de fichiers");
-      }
-
-      const entrySizeBytes = parseSizeBytes(entry.size);
-      if (Date.now() - lastHeartbeatAt >= HEARTBEAT_LOG_INTERVAL_MS) {
-        await logProgress(`Copie en cours: ${relative} (${formatSizeMiB(entrySizeBytes)})`);
-      }
-
-      const content = await downloadSourceFile(sourceSession, entry.fullpath, entrySizeBytes);
-      await uploadDestinationFile(
-        destinationSession,
-        current.destinationDir,
-        entry.file,
-        content,
-        content.byteLength || entrySizeBytes,
-      );
-
-      copiedFiles += 1;
-      copiedBytes += content.byteLength;
-
-      if (copiedFiles % 100 === 0) {
-        await logProgress(
-          `Fichiers copiés: ${copiedFiles} (${Math.round((copiedBytes / 1024 / 1024) * 10) / 10} MiB)`,
-        );
-      }
-    }
   }
+
+  await onLog?.("Nettoyage des archives temporaires...");
+  try {
+     await unlinkFile(input.sourceAccount, `/home/${input.sourceAccount}/${tempZipName}`);
+  } catch { /* ignore */ }
+  try {
+     await unlinkFile(input.destinationAccount, `${destinationPath}/${tempZipName}`);
+  } catch { /* ignore */ }
 
   await throwIfAborted(control);
   const sourceDb = parseWordPressConfigFromSoftaculous(sourceInstallation);
