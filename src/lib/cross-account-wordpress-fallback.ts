@@ -328,10 +328,14 @@ async function downloadSourceFile(
   absolutePath: string,
   expectedSizeBytes?: number,
 ): Promise<ArrayBuffer> {
-  // Use UAPI Fileman::get_file_content — returns base64 content, avoids viewer path encoding issues
+  // Use UAPI Fileman::get_file_content — pass dir + filename separately (no slashes in 'file' param)
   const timeoutMs = computeTransferTimeoutMs(expectedSizeBytes);
+  const lastSlash = absolutePath.lastIndexOf("/");
+  const fileDir = lastSlash >= 0 ? absolutePath.slice(0, lastSlash) : "/";
+  const fileName = lastSlash >= 0 ? absolutePath.slice(lastSlash + 1) : absolutePath;
   const url = new URL(`${session.baseUrl}/execute/Fileman/get_file_content`);
-  url.searchParams.set("file", absolutePath);
+  url.searchParams.set("dir", fileDir);
+  url.searchParams.set("file", fileName);
   const res = await fetchInsecure(url.toString(), {
     headers: { Cookie: session.cookie },
   }, { timeoutMs });
