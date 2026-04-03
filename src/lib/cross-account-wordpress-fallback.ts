@@ -969,25 +969,28 @@ export async function runWordPressCrossAccountCloneFallback(
      }
   }
 
-  const sourceRelativePaths = selectedPaths.map(p => p.replace(new RegExp(`^/home/${input.sourceAccount}/`), ""));
   const sourceRelativeDir = sourcePath.replace(new RegExp(`^/home/${input.sourceAccount}/`), ""); // e.g. "public_html/wp1"
   const tempZipName = `mgr_fallback_${randomToken(6)}.zip`;
-  // Always put the ZIP at account root (~) so the path is unambiguous and easy to download.
-  const destZipRelativePath = tempZipName;
+  // The ZIP is created INSIDE the source dir (dir = sourcePath, destfiles = just the filename)
+  const zipAbsolutePath = `${sourcePath}/${tempZipName}`;
 
   let copiedFiles = selectedPaths.length; // Approximate
   let copiedDirectories = 1;
   let copiedBytes = 0;
 
+  // Make sourcefiles relative to sourcePath (not to home)
+  const sourceRelativeToSource = selectedPaths.map(p =>
+    p.replace(new RegExp(`^${sourcePath}/`), "")
+  );
+
   await onLog?.("Compression cPanel: création de l'archive ZIP optimisée (sans cache/backup)...");
   
-  // Perform chunked compression if needed, but usually ~50 items is totally fine for cPanel.
   const compressRes = await cpanelApi2(input.sourceAccount, "Fileman", "fileop", {
     op: "compress",
     metadata: "zip",
-    sourcefiles: sourceRelativePaths.join(","), 
-    destfiles: destZipRelativePath, 
-    dir: `/home/${input.sourceAccount}`,
+    sourcefiles: sourceRelativeToSource.join(","),
+    destfiles: tempZipName,
+    dir: sourcePath,
     doubledecode: "1"
   });
   const compressErr = parseApi2Error(compressRes);
@@ -996,10 +999,15 @@ export async function runWordPressCrossAccountCloneFallback(
   await onLog?.("Archive prête ! Téléchargement vers le noeud de migration...");
   const zipBuffer = await downloadSourceFile(
     sourceSession, 
-    `/home/${input.sourceAccount}/${destZipRelativePath}`, 
+    zipAbsolutePath,
     250 * 1024 * 1024
   );
-  await onLog?.(`Archive téléchargée (${formatSizeMiB(zipBuffer.byteLength)}). Transférée...`);
+  await onLog?.(`Archive téléchargée (${formatSizeMiB(zipBuffer.byteLength)}). Transfert en cours...`);
+
+  // Clean up the temp zip from source server
+  try {
+    await unlinkFile(input.sourceAccount, zipAbsolutePath);
+  } catch { /* ignore cleanup errors */ }
 
   await onLog?.("Envoi de l'archive vers le serveur de destination...");
   await uploadDestinationFile(
