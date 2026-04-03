@@ -464,8 +464,18 @@ function parseApi2Error(data: unknown): string {
   if (!cpanelResult) return "";
   const error = cpanelResult.error;
   if (typeof error === "string") return error;
+  
+  if (Array.isArray(cpanelResult.data)) {
+      const first = asRecord(cpanelResult.data[0]);
+      if (first && (first.status === 0 || first.status === "0" || first.result === 0 || first.result === "0")) {
+          return String(first.statusmsg || first.reason || first.error || "Erreur interne API2");
+      }
+  }
+  
   const event = asRecord(cpanelResult.event);
-  if (typeof event?.reason === "string") return event.reason;
+  if (event && (event.result === 0 || event.result === "0")) {
+      if (typeof event.reason === "string") return event.reason;
+  }
   return "";
 }
 
@@ -958,6 +968,7 @@ export async function runWordPressCrossAccountCloneFallback(
     metadata: "zip",
     sourcefiles: sourceRelativePaths.join(","), 
     destfiles: tempZipName, 
+    dir: `/home/${input.sourceAccount}`,
     doubledecode: "1"
   });
   const compressErr = parseApi2Error(compressRes);
