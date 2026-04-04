@@ -1038,7 +1038,7 @@ export async function runWordPressCrossAccountCloneFallback(
   if (extractErr) throw new Error(`cPanel Extract API2 erreur: ${extractErr}`);
 
   await onLog?.("Réorganisation des fichiers (déplacement du contenu)...");
-  const extractedFolderName = sourceRelativeDir.split('/').filter(Boolean).pop() || "";
+  const extractedFolderName = targetFolderName;
   const nestedDirPath = `${destinationPath}/${extractedFolderName}`;
   const nestedEntries = await listDirectoryEntries(destinationSession, nestedDirPath);
   
