@@ -962,16 +962,29 @@ export async function runWordPressCrossAccountCloneFallback(
   const compressErr = parseApi2Error(compressRes);
   if (compressErr) throw new Error(`cPanel Compress API2 erreur: ${compressErr}`);
 
-  // Fallback scan:
+  // cPanel compress API is asynchronous: it returns "OK" before the ZIP is actually written to disk.
+  // We poll the directory every 5 seconds for up to 90 seconds until the file appears.
+  const ZIP_POLL_INTERVAL_MS = 5_000;
+  const ZIP_POLL_MAX_ATTEMPTS = 18; // 18 × 5s = 90 seconds
   let foundZipPath = zipAbsolutePath;
-  try {
-     const entries = await listDirectoryEntries(sourceSession, parentDir);
-     const match = entries.find(e => e.file === tempZipName);
-     if (!match) {
-         throw new Error(`Archive ZIP introuvable après compression dans ${parentDir}`);
-     }
-  } catch (err: any) {
-     throw new Error(`Archive ZIP introuvable ou erreur de listing: ${err.message}`);
+  let zipFound = false;
+  for (let attempt = 1; attempt <= ZIP_POLL_MAX_ATTEMPTS; attempt++) {
+    await sleep(ZIP_POLL_INTERVAL_MS);
+    await onLog?.(`Polling ZIP (tentative ${attempt}/${ZIP_POLL_MAX_ATTEMPTS})...`);
+    try {
+      const entries = await listDirectoryEntries(sourceSession, parentDir);
+      const match = entries.find(e => e.file === tempZipName);
+      if (match) {
+        foundZipPath = match.fullpath || zipAbsolutePath;
+        zipFound = true;
+        break;
+      }
+    } catch {
+      // listing failed, retry
+    }
+  }
+  if (!zipFound) {
+    throw new Error(`Archive ZIP introuvable après compression dans ${parentDir} (90s de polling épuisés)`);
   }
 
   await onLog?.(`Archive prête ! Récupération en mode flux (streaming)...`);
