@@ -41,3 +41,9 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 .env.local
+
+# Runtime data stores (JSON files written at runtime — never commit)
+/data/
+
+# Debug/test scripts
+/scripts/
