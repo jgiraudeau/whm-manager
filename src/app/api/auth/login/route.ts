@@ -11,7 +11,7 @@ import {
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 // Simple in-memory rate limiter: max 5 failed attempts per IP per 10 minutes.
 // Works for a single-worker deployment (Railway). For multi-instance: use Redis.
-const RATE_LIMIT_MAX_ATTEMPTS = 5;
+const RATE_LIMIT_MAX_ATTEMPTS = 10;
 const RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 
 interface RateLimitEntry {
