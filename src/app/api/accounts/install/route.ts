@@ -83,38 +83,23 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ error: `Une installation existe déjà sur ${targetDomain}` }, { status: 409 });
         }
 
-        // Charger le formulaire pour récupérer soft_status_key
-        const formUrl = `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=software&soft=${appConfig.id}`;
-        const formRes = await fetch(formUrl, { headers: { Cookie: cookie } });
-        if (!formRes.ok) {
-            throw new Error(`Impossible de charger le formulaire Softaculous (HTTP ${formRes.status})`);
-        }
-        const formHtml = await formRes.text();
-
-        const statusKeyMatch = formHtml.match(/name=["']soft_status_key["'][^>]*value=["']([^"']+)["']/i)
-            ?? formHtml.match(/value=["']([^"']+)["'][^>]*name=["']soft_status_key["']/i);
-        const softStatusKey = statusKeyMatch?.[1] ?? "";
-
         const adminUser = "admin";
         const adminPass = generateSecurePassword();
         const adminEmailFinal = adminEmail || "admin@" + targetDomain;
 
+        // Paramètres minimalistes — laisser Softaculous auto-générer dbname/dbuser
+        // Ne pas passer soft_status_key ni datadir qui peuvent bloquer silencieusement
         const installParams = new URLSearchParams({
             softsubmit: "1",
             auto_upgrade: "1",
             protocol: "https://",
             domain: targetDomain,
             in_dir: "",
-            datadir: "",
-            dbname: app === "wordpress" ? "wpdb" : "psdb",
-            dbuser: app === "wordpress" ? "wpu" : "psu",
             admin_username: adminUser,
             admin_pass: adminPass,
             admin_email: adminEmailFinal,
             language: "en",
             site_name: app === "wordpress" ? "Mon Site WordPress" : "Ma Boutique PrestaShop",
-            site_desc: "Installé par WHM Manager",
-            ...(softStatusKey ? { soft_status_key: softStatusKey } : {}),
         });
 
         // Soumettre l'installation
