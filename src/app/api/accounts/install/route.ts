@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getCPanelSessionData, cpanelApi } from "@/lib/whm";
 import { ensureAccountAccess, requireAuthSession, safeError } from "@/lib/auth";
 import { isValidCpanelUsername } from "@/lib/validators";
+import { extractSoftaculousError } from "@/lib/softaculous";
 
 const SOFTACULOUS_APPS: Record<string, { id: number; name: string }> = {
     wordpress: { id: 26, name: "WordPress" },
@@ -16,6 +17,22 @@ function generateSecurePassword(): string {
     const bytes = new Uint8Array(12);
     crypto.getRandomValues(bytes);
     return Array.from(bytes, (b) => charset[b % charset.length]).join("");
+}
+
+function parseMaybeJson(input: string): Record<string, unknown> | null {
+    try {
+        const parsed = JSON.parse(input) as unknown;
+        if (typeof parsed === "object" && parsed !== null) {
+            return parsed as Record<string, unknown>;
+        }
+    } catch {
+        // ignore
+    }
+    return null;
+}
+
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export async function POST(req: NextRequest) {
@@ -40,7 +57,7 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ error: "Format du sous-domaine invalide" }, { status: 400 });
         }
 
-        // 1. Create subdomain if requested
+        // 1. Créer le sous-domaine si demandé
         let finalDomain = targetDomain;
         if (subdomain) {
             try {
@@ -49,15 +66,11 @@ export async function POST(req: NextRequest) {
                     rootdomain: targetDomain,
                     dir: `public_html/${subdomain}`,
                 });
-                // Note: result 0 often means "already exists" in some contexts, but let's check metadata
-                // If it fails but results show it exists, we continue.
                 if (subRes.metadata?.result === 0 && !subRes.errors?.some((e: string) => e.toLowerCase().includes("exist"))) {
                     throw new Error("Erreur lors de la création du sous-domaine");
                 }
                 finalDomain = `${subdomain}.${targetDomain}`;
             } catch (err) {
-                // If the error says it already exists, we silent it. 
-                // Otherwise report.
                 const msg = safeError(err);
                 if (!msg.toLowerCase().includes("exist")) {
                     throw new Error(`Échec création sous-domaine: ${msg}`);
@@ -78,6 +91,20 @@ export async function POST(req: NextRequest) {
         const adminPass = generateSecurePassword();
         const adminEmailFinal = adminEmail || "admin@" + finalDomain;
 
+        // 2. Charger le formulaire d'installation pour récupérer soft_status_key et les champs cachés
+        const formUrl = `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=software&soft=${appConfig.id}`;
+        const formRes = await fetch(formUrl, { headers: { Cookie: cookie } });
+        if (!formRes.ok) {
+            throw new Error(`Impossible de charger le formulaire Softaculous (HTTP ${formRes.status})`);
+        }
+        const formHtml = await formRes.text();
+
+        // Extraire soft_status_key depuis le formulaire
+        const statusKeyMatch = formHtml.match(/name=["']soft_status_key["'][^>]*value=["']([^"']+)["']/i)
+            ?? formHtml.match(/value=["']([^"']+)["'][^>]*name=["']soft_status_key["']/i);
+        const softStatusKey = statusKeyMatch?.[1] ?? "";
+
+        // 3. Soumettre l'installation avec api=json pour une réponse structurée
         const installParams = new URLSearchParams({
             softsubmit: "1",
             auto_upgrade: "1",
@@ -93,10 +120,11 @@ export async function POST(req: NextRequest) {
             language: "fr",
             site_name: app === "wordpress" ? "Mon Site WordPress" : "Ma Boutique PrestaShop",
             site_desc: "Installé par WHM Manager",
+            ...(softStatusKey ? { soft_status_key: softStatusKey } : {}),
         });
 
-        const softaUrl = `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=software&soft=${appConfig.id}`;
-        const installRes = await fetch(softaUrl, {
+        const installUrl = `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=software&soft=${appConfig.id}&api=json`;
+        const installRes = await fetch(installUrl, {
             method: "POST",
             headers: {
                 Cookie: cookie,
@@ -105,28 +133,98 @@ export async function POST(req: NextRequest) {
             body: installParams.toString(),
         });
 
-        const html = await installRes.text();
-        const isSuccess =
-            html.includes("Installation Complete") ||
-            html.includes("installé avec succès") ||
-            html.includes("was installed") ||
-            html.includes("successfully installed");
+        const rawText = await installRes.text();
+        const installData = parseMaybeJson(rawText);
 
-        if (!isSuccess && installRes.status !== 200) {
-            throw new Error("Installation échouée");
+        // Vérifier les erreurs Softaculous dans la réponse JSON
+        const softaculousError = extractSoftaculousError(installData);
+        if (softaculousError) {
+            throw new Error(softaculousError);
         }
 
-        const siteUrl = `https://${finalDomain}`;
+        if (!installRes.ok) {
+            throw new Error(`Installation échouée (HTTP ${installRes.status})`);
+        }
 
-        return NextResponse.json({
-            success: true,
-            app: appConfig.name,
-            siteUrl,
-            adminUrl: app === "wordpress" ? `${siteUrl}/wp-admin` : `${siteUrl}/admin123`,
-            adminUser,
-            adminPass,
-            adminEmail: adminEmailFinal,
-        });
+        // Déterminer si l'installation est terminée ou asynchrone
+        const taskId =
+            typeof installData?.taskid === "string" ? installData.taskid :
+            typeof installData?.task_id === "string" ? installData.task_id : null;
+
+        const returnedInsid =
+            typeof installData?.insid === "string" && (installData.insid as string).trim().length > 0
+                ? installData.insid
+                : null;
+
+        const doneMessage =
+            typeof installData?.done_msg === "string" ? installData.done_msg :
+            typeof installData?.msg === "string" ? installData.msg : null;
+
+        const isCompleted =
+            installData?.done === true ||
+            Boolean(returnedInsid) ||
+            /Installation Complete|successfully installed|installé avec succès|was installed/i.test(rawText);
+
+        const siteUrl = `https://${finalDomain}`;
+        const adminUrl = app === "wordpress" ? `${siteUrl}/wp-admin` : `${siteUrl}/admin`;
+
+        if (isCompleted) {
+            return NextResponse.json({
+                success: true,
+                pending: false,
+                app: appConfig.name,
+                siteUrl,
+                adminUrl,
+                adminUser,
+                adminPass,
+                adminEmail: adminEmailFinal,
+                message: doneMessage ?? `${appConfig.name} installé sur ${finalDomain}`,
+            });
+        }
+
+        // Si Softaculous répond sans erreur mais en async (taskId ou message)
+        if (taskId || doneMessage) {
+            // Attendre quelques secondes et vérifier dans la liste des installations
+            for (let attempt = 0; attempt < 3; attempt++) {
+                await sleep(3000);
+                const listRes = await fetch(
+                    `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=installations&api=json`,
+                    { headers: { Cookie: cookie } }
+                );
+                if (listRes.ok) {
+                    const listText = await listRes.text();
+                    if (listText.includes(finalDomain)) {
+                        return NextResponse.json({
+                            success: true,
+                            pending: false,
+                            app: appConfig.name,
+                            siteUrl,
+                            adminUrl,
+                            adminUser,
+                            adminPass,
+                            adminEmail: adminEmailFinal,
+                            message: `${appConfig.name} installé sur ${finalDomain}`,
+                        });
+                    }
+                }
+            }
+
+            return NextResponse.json({
+                success: true,
+                pending: true,
+                app: appConfig.name,
+                siteUrl,
+                adminUrl,
+                adminUser,
+                adminPass,
+                adminEmail: adminEmailFinal,
+                taskId,
+                message: doneMessage ?? `Installation lancée sur ${finalDomain}. Vérifiez dans 1 à 2 minutes.`,
+            });
+        }
+
+        throw new Error("Softaculous n'a pas confirmé l'installation. Vérifiez les logs cPanel.");
+
     } catch (error: unknown) {
         return NextResponse.json({ error: safeError(error, "Erreur lors de l'installation") }, { status: 500 });
     }
