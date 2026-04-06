@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getCPanelSessionData } from "@/lib/whm";
+import { getCPanelSessionData, cpanelApi } from "@/lib/whm";
 import { ensureAccountAccess, requireAuthSession, safeError } from "@/lib/auth";
 import { isValidCpanelUsername } from "@/lib/validators";
 
@@ -9,6 +9,7 @@ const SOFTACULOUS_APPS: Record<string, { id: number; name: string }> = {
 };
 
 const DOMAIN_RE = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$/i;
+const SUBDOMAIN_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/i;
 
 function generateSecurePassword(): string {
     const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%&";
@@ -22,7 +23,7 @@ export async function POST(req: NextRequest) {
     if (denied) return denied;
 
     try {
-        const { user, app, adminEmail, targetDomain } = await req.json();
+        const { user, app, adminEmail, targetDomain, subdomain } = await req.json();
 
         if (!user || !app || !targetDomain) {
             return NextResponse.json({ error: "Paramètres manquants" }, { status: 400 });
@@ -35,6 +36,35 @@ export async function POST(req: NextRequest) {
         if (!DOMAIN_RE.test(targetDomain)) {
             return NextResponse.json({ error: "Domaine cible invalide" }, { status: 400 });
         }
+        if (subdomain && !SUBDOMAIN_RE.test(subdomain)) {
+            return NextResponse.json({ error: "Format du sous-domaine invalide" }, { status: 400 });
+        }
+
+        // 1. Create subdomain if requested
+        let finalDomain = targetDomain;
+        if (subdomain) {
+            try {
+                const subRes = await cpanelApi(user, "SubDomain", "addsubdomain", {
+                    domain: subdomain,
+                    rootdomain: targetDomain,
+                    dir: `public_html/${subdomain}`,
+                });
+                // Note: result 0 often means "already exists" in some contexts, but let's check metadata
+                // If it fails but results show it exists, we continue.
+                if (subRes.metadata?.result === 0 && !subRes.errors?.some((e: string) => e.toLowerCase().includes("exist"))) {
+                    throw new Error("Erreur lors de la création du sous-domaine");
+                }
+                finalDomain = `${subdomain}.${targetDomain}`;
+            } catch (err) {
+                // If the error says it already exists, we silent it. 
+                // Otherwise report.
+                const msg = safeError(err);
+                if (!msg.toLowerCase().includes("exist")) {
+                    throw new Error(`Échec création sous-domaine: ${msg}`);
+                }
+                finalDomain = `${subdomain}.${targetDomain}`;
+            }
+        }
 
         const appConfig = SOFTACULOUS_APPS[app];
         if (!appConfig) {
@@ -46,13 +76,13 @@ export async function POST(req: NextRequest) {
 
         const adminUser = "admin";
         const adminPass = generateSecurePassword();
-        const adminEmailFinal = adminEmail || "admin@" + targetDomain;
+        const adminEmailFinal = adminEmail || "admin@" + finalDomain;
 
         const installParams = new URLSearchParams({
             softsubmit: "1",
             auto_upgrade: "1",
             protocol: "https://",
-            domain: targetDomain,
+            domain: finalDomain,
             in_dir: "",
             datadir: "",
             dbname: app === "wordpress" ? "wpdb" : "psdb",
@@ -86,7 +116,7 @@ export async function POST(req: NextRequest) {
             throw new Error("Installation échouée");
         }
 
-        const siteUrl = `https://${targetDomain}`;
+        const siteUrl = `https://${finalDomain}`;
 
         return NextResponse.json({
             success: true,

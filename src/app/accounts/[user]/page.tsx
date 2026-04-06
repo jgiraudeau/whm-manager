@@ -103,6 +103,7 @@ export default function AccountDetailPage() {
     const [cloneChecking, setCloneChecking] = useState(false);
     const [installations, setInstallations] = useState<SoftInstall[]>([]);
     const [installationsLoading, setInstallationsLoading] = useState(false);
+    const [installSubdomain, setInstallSubdomain] = useState("");
 
     const fetchAutoSSLStatus = useCallback(async () => {
         try {
@@ -299,7 +300,13 @@ export default function AccountDetailPage() {
             const res = await fetch("/api/accounts/install", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ user, app, adminEmail: account?.email, targetDomain: selectedInstallDomain }),
+                body: JSON.stringify({ 
+                    user, 
+                    app, 
+                    adminEmail: account?.email, 
+                    targetDomain: selectedInstallDomain,
+                    subdomain: installSubdomain 
+                }),
             });
             const data = await res.json();
             if (data.error) throw new Error(data.error);
@@ -573,6 +580,24 @@ export default function AccountDetailPage() {
                         </select>
                     )}
                 </div>
+
+                <div className="mb-6">
+                    <label className="block text-[10px] uppercase font-bold tracking-wider text-gray-500 mb-1.5">Sous-domaine cible (optionnel)</label>
+                    <div className="flex items-center bg-gray-800 border border-gray-700 rounded-lg overflow-hidden focus-within:border-blue-500 transition-all shadow-inner">
+                        <input
+                            type="text"
+                            placeholder="ex: boutique (laisser vide pour la racine)"
+                            value={installSubdomain}
+                            onChange={e => setInstallSubdomain(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ""))}
+                            className="flex-1 bg-transparent px-4 py-2 text-white text-sm placeholder-gray-600 focus:outline-none"
+                        />
+                        {selectedInstallDomain && (
+                            <span className="px-3 text-gray-500 text-xs border-l border-gray-700 py-2 bg-gray-900/30 font-medium">.{selectedInstallDomain}</span>
+                        )}
+                    </div>
+                    <p className="text-[10px] text-gray-600 mt-1">Si le sous-domaine n&apos;existe pas, il sera créé automatiquement.</p>
+                </div>
+
                 <div className="grid grid-cols-2 gap-4">
                     <button onClick={() => installApp("wordpress")} disabled={!!actionLoading}
                         className="flex flex-col items-center gap-3 p-5 bg-blue-950/20 hover:bg-blue-950/40 border border-blue-900/30 hover:border-blue-600/50 rounded-xl transition-all disabled:opacity-40 group relative overflow-hidden">
