@@ -30,6 +30,20 @@ function parseMaybeJson(input: string): Record<string, unknown> | null {
     return null;
 }
 
+function extractSelectOptions(html: string, selectName: string): string[] {
+    const escapedName = selectName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const selectRegex = new RegExp(`<select\\b[^>]*\\bname=["']${escapedName}["'][^>]*>([\\s\\S]*?)<\\/select>`, "i");
+    const selectMatch = html.match(selectRegex);
+    if (!selectMatch) return [];
+    const optionRegex = /<option\b[^>]*value=["']([^"']*)["'][^>]*>/gi;
+    const options: string[] = [];
+    let match: RegExpExecArray | null;
+    while ((match = optionRegex.exec(selectMatch[1])) !== null) {
+        if (match[1]) options.push(match[1]);
+    }
+    return options;
+}
+
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -87,19 +101,46 @@ export async function POST(req: NextRequest) {
         const adminPass = generateSecurePassword();
         const adminEmailFinal = adminEmail || "admin@" + targetDomain;
 
-        // Paramètres minimalistes — laisser Softaculous auto-générer dbname/dbuser
-        // Ne pas passer soft_status_key ni datadir qui peuvent bloquer silencieusement
+        // Fetcher le formulaire d'install pour extraire les options du select "softdomain"
+        // Softaculous ignore domain= s'il ne correspond pas exactement à une option du select
+        const formUrl = `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=software&soft=${appConfig.id}`;
+        const formRes = await fetch(formUrl, { headers: { Cookie: cookie } });
+        const formHtml = formRes.ok ? await formRes.text() : "";
+
+        // Extraire les options disponibles du select softdomain
+        const softdomainOptions = extractSelectOptions(formHtml, "softdomain");
+        const targetHost = normalizeHost(targetDomain);
+
+        // Trouver l'option qui correspond au sous-domaine ciblé
+        const matchedOption = softdomainOptions.find((opt) => normalizeHost(opt) === targetHost)
+            ?? softdomainOptions.find((opt) => opt.includes(targetHost));
+
+        // Si aucune option ne correspond, le sous-domaine n'existe pas encore dans cPanel
+        if (softdomainOptions.length > 0 && !matchedOption) {
+            return NextResponse.json({
+                error: `Le domaine "${targetDomain}" n'est pas disponible dans Softaculous. Créez d'abord le sous-domaine dans cPanel.`,
+            }, { status: 400 });
+        }
+
+        const softdomainValue = matchedOption ?? targetDomain;
+
+        // Extraire soft_status_key (requis par certaines versions de Softaculous)
+        const statusKeyMatch = formHtml.match(/name=["']soft_status_key["'][^>]*value=["']([^"']+)["']/i)
+            ?? formHtml.match(/value=["']([^"']+)["'][^>]*name=["']soft_status_key["']/i);
+        const softStatusKey = statusKeyMatch?.[1];
+
         const installParams = new URLSearchParams({
             softsubmit: "1",
             auto_upgrade: "1",
-            protocol: "https://",
-            domain: targetDomain,
-            in_dir: "",
+            softproto: "https://",
+            softdomain: softdomainValue,
+            softdirectory: "",
             admin_username: adminUser,
             admin_pass: adminPass,
             admin_email: adminEmailFinal,
             language: "en",
             site_name: app === "wordpress" ? "Mon Site WordPress" : "Ma Boutique PrestaShop",
+            ...(softStatusKey ? { soft_status_key: softStatusKey } : {}),
         });
 
         // Soumettre l'installation
