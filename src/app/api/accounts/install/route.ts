@@ -111,7 +111,7 @@ export async function POST(req: NextRequest) {
             admin_username: adminUser,
             admin_pass: adminPass,
             admin_email: adminEmailFinal,
-            language: "fr",
+            language: "en",
             site_name: app === "wordpress" ? "Mon Site WordPress" : "Ma Boutique PrestaShop",
             site_desc: "Installé par WHM Manager",
             ...(softStatusKey ? { soft_status_key: softStatusKey } : {}),
