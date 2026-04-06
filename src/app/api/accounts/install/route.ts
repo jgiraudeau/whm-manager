@@ -157,6 +157,10 @@ export async function POST(req: NextRequest) {
         const rawText = await installRes.text();
         const installData = parseMaybeJson(rawText);
 
+        // Log pour diagnostic
+        console.log(`[install] app=${app} domain=${targetDomain} status=${installRes.status}`);
+        console.log(`[install] rawText=`, rawText.slice(0, 500));
+
         const softaculousError = extractSoftaculousError(installData);
         if (softaculousError) {
             throw new Error(softaculousError);
