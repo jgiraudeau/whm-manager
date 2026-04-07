@@ -208,6 +208,7 @@ export async function POST(req: NextRequest) {
             language: "en",
             site_name: app === "wordpress" ? "Mon Site WordPress" : "Ma Boutique PrestaShop",
             overwrite_existing: "1",
+            php_version_select: "1",
             ...(softStatusKey ? { soft_status_key: softStatusKey } : {}),
         });
 
