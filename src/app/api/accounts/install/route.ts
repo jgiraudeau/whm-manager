@@ -101,9 +101,14 @@ export async function POST(req: NextRequest) {
         const existingInsid = await findInstallationId(baseUrl, cookie, targetDomain);
         console.log(`[install] existingInsid=${existingInsid}`);
         if (existingInsid) {
+            const removeParams = new URLSearchParams({
+                softsubmit: "1",
+                removedb: "1",
+                removedir: "1",
+            });
             const removeRes = await fetch(
-                `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=remove&insid=${encodeURIComponent(existingInsid)}&removedb=1&removedir=1&api=json`,
-                { method: "POST", headers: { Cookie: cookie } }
+                `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=remove&insid=${encodeURIComponent(existingInsid)}&api=json`,
+                { method: "POST", headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" }, body: removeParams.toString() }
             );
             const removeText = await removeRes.text();
             console.log(`[install] removeStatus=${removeRes.status} removeText=`, removeText.slice(0, 300));
