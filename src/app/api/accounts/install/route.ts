@@ -182,7 +182,25 @@ export async function POST(req: NextRequest) {
             );
             const removeText = await removeRes.text();
             console.log(`[install] removeStatus=${removeRes.status} removeText=`, removeText.slice(0, 300));
-            await sleep(5000);
+            await sleep(3000);
+
+            // Vider le dossier cible via cPanel Fileman pour éviter "some_files_exist"
+            // On supprime le dossier puis on le recrée vide
+            const subdir = targetDomain.split(".")[0]; // ex: "testpresta"
+            try {
+                await fetch(
+                    `${baseUrl}/execute/Fileman/remove_files`,
+                    {
+                        method: "POST",
+                        headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" },
+                        body: new URLSearchParams({ "files[0][path]": "public_html", "files[0][file]": subdir }).toString(),
+                    }
+                );
+                console.log(`[install] dossier public_html/${subdir} supprimé`);
+            } catch (e) {
+                console.log(`[install] suppression dossier ignorée:`, e);
+            }
+            await sleep(1000);
         }
 
         const adminUser = "admin";
