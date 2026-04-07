@@ -255,6 +255,7 @@ export async function POST(req: NextRequest) {
             language: "en",
             site_name: app === "wordpress" ? "Mon Site WordPress" : "Ma Boutique PrestaShop",
             php_version_select: "1",
+            overwrite_existing: "1",
             cookie_key: generateSecurePassword() + generateSecurePassword(),
             ...(softStatusKey ? { soft_status_key: softStatusKey } : {}),
         });
