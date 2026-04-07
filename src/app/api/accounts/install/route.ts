@@ -65,14 +65,6 @@ async function findInstallationId(baseUrl: string, cookie: string, domain: strin
     return null;
 }
 
-async function uninstallExisting(baseUrl: string, cookie: string, insid: string): Promise<void> {
-    await fetch(
-        `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=remove&insid=${encodeURIComponent(insid)}&removedb=1&removedir=1&api=json`,
-        { method: "POST", headers: { Cookie: cookie } }
-    );
-    // Attendre que Softaculous finalise la suppression
-    await sleep(3000);
-}
 
 async function findInstallation(baseUrl: string, cookie: string, domain: string): Promise<boolean> {
     return (await findInstallationId(baseUrl, cookie, domain)) !== null;
@@ -107,9 +99,26 @@ export async function POST(req: NextRequest) {
 
         // Si une installation existe déjà sur ce domaine, la supprimer d'abord
         const existingInsid = await findInstallationId(baseUrl, cookie, targetDomain);
+        console.log(`[install] existingInsid=${existingInsid}`);
         if (existingInsid) {
-            await uninstallExisting(baseUrl, cookie, existingInsid);
+            const removeRes = await fetch(
+                `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=remove&insid=${encodeURIComponent(existingInsid)}&removedb=1&removedir=1&api=json`,
+                { method: "POST", headers: { Cookie: cookie } }
+            );
+            const removeText = await removeRes.text();
+            console.log(`[install] removeStatus=${removeRes.status} removeText=`, removeText.slice(0, 300));
+            await sleep(3000);
         }
+
+        // Debug : lister toutes les installations détectées
+        const listRes2 = await fetch(
+            `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=installations&api=json`,
+            { headers: { Cookie: cookie } }
+        );
+        const listText2 = await listRes2.text();
+        const listData2 = parseMaybeJson(listText2);
+        const allInstalls = extractSoftaculousInstallations(listData2);
+        console.log(`[install] installations détectées:`, Object.values(allInstalls).map(i => i.softurl ?? i.domain));
 
         const adminUser = "admin";
         const adminPass = generateSecurePassword();
