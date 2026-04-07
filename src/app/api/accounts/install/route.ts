@@ -4,9 +4,9 @@ import { ensureAccountAccess, requireAuthSession, safeError } from "@/lib/auth";
 import { isValidCpanelUsername } from "@/lib/validators";
 import { extractSoftaculousError, extractSoftaculousInstallations, normalizeHost } from "@/lib/softaculous";
 
-const SOFTACULOUS_APPS: Record<string, { id: number; name: string }> = {
-    wordpress: { id: 26, name: "WordPress" },
-    prestashop: { id: 29, name: "PrestaShop" },
+const APP_KEYWORDS: Record<string, string[]> = {
+    wordpress: ["wordpress"],
+    prestashop: ["prestashop"],
 };
 
 const DOMAIN_RE = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$/i;
@@ -21,12 +21,8 @@ function generateSecurePassword(): string {
 function parseMaybeJson(input: string): Record<string, unknown> | null {
     try {
         const parsed = JSON.parse(input) as unknown;
-        if (typeof parsed === "object" && parsed !== null) {
-            return parsed as Record<string, unknown>;
-        }
-    } catch {
-        // ignore
-    }
+        if (typeof parsed === "object" && parsed !== null) return parsed as Record<string, unknown>;
+    } catch { /* ignore */ }
     return null;
 }
 
@@ -55,19 +51,44 @@ async function findInstallationId(baseUrl: string, cookie: string, domain: strin
         { headers: { Cookie: cookie } }
     );
     if (!res.ok) return null;
-    const text = await res.text();
-    const data = parseMaybeJson(text);
+    const data = parseMaybeJson(await res.text());
     const installations = extractSoftaculousInstallations(data);
     for (const [id, install] of Object.entries(installations)) {
-        const host = normalizeHost(install.softurl ?? install.domain ?? "");
-        if (host === targetHost) return id;
+        if (normalizeHost(install.softurl ?? install.domain ?? "") === targetHost) return id;
     }
     return null;
 }
 
-
 async function findInstallation(baseUrl: string, cookie: string, domain: string): Promise<boolean> {
     return (await findInstallationId(baseUrl, cookie, domain)) !== null;
+}
+
+// Cherche l'ID de l'app dans la liste Softaculous (varie selon le serveur)
+async function findAppId(baseUrl: string, cookie: string, app: string): Promise<number | null> {
+    const keywords = APP_KEYWORDS[app] ?? [app];
+    const res = await fetch(
+        `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=scripts&api=json`,
+        { headers: { Cookie: cookie } }
+    );
+    if (!res.ok) return null;
+    const text = await res.text();
+    const data = parseMaybeJson(text);
+    if (!data) return null;
+
+    // La liste des scripts peut être dans data.scripts ou data.data.scripts
+    const scripts = (data.scripts ?? (data.data as Record<string, unknown>)?.scripts) as Record<string, unknown> | undefined;
+    if (!scripts) return null;
+
+    for (const [idStr, script] of Object.entries(scripts)) {
+        const s = script as Record<string, unknown>;
+        const name = (typeof s.name === "string" ? s.name : "").toLowerCase();
+        const softname = (typeof s.softname === "string" ? s.softname : "").toLowerCase();
+        if (keywords.some(kw => name.includes(kw) || softname.includes(kw))) {
+            const id = parseInt(idStr, 10);
+            if (!isNaN(id)) return id;
+        }
+    }
+    return null;
 }
 
 export async function POST(req: NextRequest) {
@@ -88,27 +109,29 @@ export async function POST(req: NextRequest) {
         if (!DOMAIN_RE.test(targetDomain)) {
             return NextResponse.json({ error: "Domaine cible invalide" }, { status: 400 });
         }
-
-        const appConfig = SOFTACULOUS_APPS[app];
-        if (!appConfig) {
+        if (!APP_KEYWORDS[app]) {
             return NextResponse.json({ error: `Application "${app}" non supportée` }, { status: 400 });
         }
 
+        const appName = app === "wordpress" ? "WordPress" : "PrestaShop";
         const { host, cpsess, cookie } = await getCPanelSessionData(user);
         const baseUrl = `https://${host}:2083/${cpsess}`;
 
-        // Si une installation existe déjà sur ce domaine, la supprimer d'abord
+        // Chercher l'ID de l'app dynamiquement
+        let appId = await findAppId(baseUrl, cookie, app);
+        console.log(`[install] appId dynamique pour ${app}=${appId}`);
+        // Fallback IDs connus
+        if (!appId) appId = app === "wordpress" ? 26 : 29;
+
+        // Supprimer l'installation existante si elle existe
         const existingInsid = await findInstallationId(baseUrl, cookie, targetDomain);
         console.log(`[install] existingInsid=${existingInsid}`);
         if (existingInsid) {
-            // 1. Charger le formulaire de suppression pour extraire les champs cachés
             const removeFormRes = await fetch(
                 `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=remove&insid=${encodeURIComponent(existingInsid)}`,
                 { headers: { Cookie: cookie } }
             );
             const removeFormHtml = removeFormRes.ok ? await removeFormRes.text() : "";
-
-            // Extraire tous les champs hidden du formulaire
             const hiddenFields: Record<string, string> = {};
             const hiddenRegex = /<input[^>]+type=["']hidden["'][^>]*>/gi;
             let hMatch: RegExpExecArray | null;
@@ -117,53 +140,33 @@ export async function POST(req: NextRequest) {
                 const valM = hMatch[0].match(/value=["']([^"']*)["']/i);
                 if (nameM?.[1]) hiddenFields[nameM[1]] = valM?.[1] ?? "";
             }
-            console.log(`[install] removeFormFields=`, hiddenFields);
-
-            // 2. Soumettre la suppression avec les champs du formulaire
-            const removeParams = new URLSearchParams({
-                ...hiddenFields,
-                softsubmit: "1",
-                removedb: "1",
-                removedir: "1",
-            });
+            const removeParams = new URLSearchParams({ ...hiddenFields, softsubmit: "1", removedb: "1", removedir: "1" });
             const removeRes = await fetch(
                 `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=remove&insid=${encodeURIComponent(existingInsid)}&api=json`,
                 { method: "POST", headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" }, body: removeParams.toString() }
             );
             const removeText = await removeRes.text();
-            console.log(`[install] removeStatus=${removeRes.status} removeText=`, removeText.slice(0, 400));
+            console.log(`[install] removeStatus=${removeRes.status} removeText=`, removeText.slice(0, 300));
             await sleep(5000);
         }
-
-        // Debug : lister toutes les installations détectées
-        const listRes2 = await fetch(
-            `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=installations&api=json`,
-            { headers: { Cookie: cookie } }
-        );
-        const listText2 = await listRes2.text();
-        const listData2 = parseMaybeJson(listText2);
-        const allInstalls = extractSoftaculousInstallations(listData2);
-        console.log(`[install] installations détectées:`, Object.values(allInstalls).map(i => i.softurl ?? i.domain));
 
         const adminUser = "admin";
         const adminPass = generateSecurePassword();
         const adminEmailFinal = adminEmail || "admin@" + targetDomain;
 
-        // Fetcher le formulaire d'install pour extraire les options du select "softdomain"
-        // Softaculous ignore domain= s'il ne correspond pas exactement à une option du select
-        const formUrl = `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=software&soft=${appConfig.id}`;
+        // Fetcher le formulaire pour extraire softdomain et soft_status_key
+        const formUrl = `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=software&soft=${appId}`;
         const formRes = await fetch(formUrl, { headers: { Cookie: cookie } });
         const formHtml = formRes.ok ? await formRes.text() : "";
+        console.log(`[install] formUrl=${formUrl} formStatus=${formRes.status} formLength=${formHtml.length}`);
 
-        // Extraire les options disponibles du select softdomain
         const softdomainOptions = extractSelectOptions(formHtml, "softdomain");
         const targetHost = normalizeHost(targetDomain);
-
-        // Trouver l'option qui correspond au sous-domaine ciblé
         const matchedOption = softdomainOptions.find((opt) => normalizeHost(opt) === targetHost)
             ?? softdomainOptions.find((opt) => opt.includes(targetHost));
 
-        // Si aucune option ne correspond, le sous-domaine n'existe pas encore dans cPanel
+        console.log(`[install] softdomainOptions=`, softdomainOptions.slice(0, 5), `matched=${matchedOption}`);
+
         if (softdomainOptions.length > 0 && !matchedOption) {
             return NextResponse.json({
                 error: `Le domaine "${targetDomain}" n'est pas disponible dans Softaculous. Créez d'abord le sous-domaine dans cPanel.`,
@@ -171,8 +174,6 @@ export async function POST(req: NextRequest) {
         }
 
         const softdomainValue = matchedOption ?? targetDomain;
-
-        // Extraire soft_status_key (requis par certaines versions de Softaculous)
         const statusKeyMatch = formHtml.match(/name=["']soft_status_key["'][^>]*value=["']([^"']+)["']/i)
             ?? formHtml.match(/value=["']([^"']+)["'][^>]*name=["']soft_status_key["']/i);
         const softStatusKey = statusKeyMatch?.[1];
@@ -192,83 +193,47 @@ export async function POST(req: NextRequest) {
             ...(softStatusKey ? { soft_status_key: softStatusKey } : {}),
         });
 
-        // Soumettre l'installation
-        const installUrl = `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=software&soft=${appConfig.id}&api=json`;
+        const installUrl = `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=software&soft=${appId}&api=json`;
         const installRes = await fetch(installUrl, {
             method: "POST",
-            headers: {
-                Cookie: cookie,
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
+            headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" },
             body: installParams.toString(),
         });
 
         const rawText = await installRes.text();
         const installData = parseMaybeJson(rawText);
-
-        // Log pour diagnostic
-        console.log(`[install] app=${app} domain=${targetDomain} status=${installRes.status}`);
+        console.log(`[install] app=${app} appId=${appId} domain=${targetDomain} status=${installRes.status}`);
         console.log(`[install] rawText=`, rawText.slice(0, 500));
 
         const softaculousError = extractSoftaculousError(installData);
-        if (softaculousError) {
-            throw new Error(softaculousError);
-        }
-        if (!installRes.ok) {
-            throw new Error(`Installation échouée (HTTP ${installRes.status})`);
-        }
+        if (softaculousError) throw new Error(softaculousError);
+        if (!installRes.ok) throw new Error(`Installation échouée (HTTP ${installRes.status})`);
 
         const siteUrl = `https://${targetDomain}`;
         const adminUrl = app === "wordpress" ? `${siteUrl}/wp-admin` : `${siteUrl}/admin`;
 
-        // Si Softaculous confirme done:true, on retourne immédiatement (PrestaShop peut prendre 2-5 min)
         if (installData?.done === true) {
             return NextResponse.json({
-                success: true,
-                pending: true,
-                app: appConfig.name,
-                siteUrl,
-                adminUrl,
-                adminUser,
-                adminPass,
-                adminEmail: adminEmailFinal,
-                message: `Installation de ${appConfig.name} lancée sur ${targetDomain}. Le site sera disponible dans quelques minutes.`,
+                success: true, pending: true, app: appName, siteUrl, adminUrl,
+                adminUser, adminPass, adminEmail: adminEmailFinal,
+                message: `Installation de ${appName} lancée sur ${targetDomain}. Le site sera disponible dans quelques minutes.`,
             });
         }
 
-        // Sinon polling court (WordPress se finit rapidement)
         for (let attempt = 0; attempt < 6; attempt++) {
             await sleep(5000);
-            const found = await findInstallation(baseUrl, cookie, targetDomain);
-            if (found) {
+            if (await findInstallation(baseUrl, cookie, targetDomain)) {
                 return NextResponse.json({
-                    success: true,
-                    pending: false,
-                    app: appConfig.name,
-                    siteUrl,
-                    adminUrl,
-                    adminUser,
-                    adminPass,
-                    adminEmail: adminEmailFinal,
-                    message: `${appConfig.name} installé sur ${targetDomain}`,
+                    success: true, pending: false, app: appName, siteUrl, adminUrl,
+                    adminUser, adminPass, adminEmail: adminEmailFinal,
+                    message: `${appName} installé sur ${targetDomain}`,
                 });
             }
         }
 
-        const taskId =
-            typeof installData?.taskid === "string" ? installData.taskid :
-            typeof installData?.task_id === "string" ? installData.task_id : null;
-
         return NextResponse.json({
-            success: true,
-            pending: true,
-            app: appConfig.name,
-            siteUrl,
-            adminUrl,
-            adminUser,
-            adminPass,
-            adminEmail: adminEmailFinal,
-            taskId,
+            success: true, pending: true, app: appName, siteUrl, adminUrl,
+            adminUser, adminPass, adminEmail: adminEmailFinal,
             message: `Installation lancée sur ${targetDomain}. Vérifiez dans quelques minutes.`,
         });
 
