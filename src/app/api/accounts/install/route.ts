@@ -158,6 +158,9 @@ export async function POST(req: NextRequest) {
         // Fallback IDs connus
         if (!appId) appId = app === "wordpress" ? 26 : 29;
 
+        const subdir = targetDomain.split(".")[0]; // ex: "testpresta"
+        const installDir = `public_html/${subdir}`;
+
         // Supprimer l'installation existante si elle existe
         const existingInsid = await findInstallationId(baseUrl, cookie, targetDomain);
         console.log(`[install] existingInsid=${existingInsid}`);
@@ -184,33 +187,19 @@ export async function POST(req: NextRequest) {
             console.log(`[install] removeStatus=${removeRes.status} removeText=`, removeText.slice(0, 300));
             await sleep(3000);
 
-            // Vider le contenu du dossier cible via cPanel Fileman pour éviter "some_files_exist"
-            const subdir = targetDomain.split(".")[0]; // ex: "testpresta"
+            // Supprimer le dossier entier pour repartir sur une base propre
             try {
-                // Lister les fichiers du dossier
-                const listRes = await fetch(
-                    `${baseUrl}/execute/Fileman/list_files?dir=public_html%2F${subdir}&include_mime=0`,
-                    { headers: { Cookie: cookie } }
-                );
-                if (listRes.ok) {
-                    const listData = await listRes.json() as { data?: { files?: { file: string }[] } };
-                    const files = listData?.data?.files ?? [];
-                    if (files.length > 0) {
-                        const params = new URLSearchParams();
-                        files.forEach((f, i) => {
-                            params.set(`files[${i}][path]`, `public_html/${subdir}`);
-                            params.set(`files[${i}][file]`, f.file);
-                        });
-                        await fetch(`${baseUrl}/execute/Fileman/remove_files`, {
-                            method: "POST",
-                            headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" },
-                            body: params.toString(),
-                        });
-                        console.log(`[install] ${files.length} fichiers supprimés dans public_html/${subdir}`);
-                    }
-                }
+                const delRes = await fetch(`${baseUrl}/execute/Fileman/remove_files`, {
+                    method: "POST",
+                    headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" },
+                    body: new URLSearchParams({
+                        "files[0][path]": "public_html",
+                        "files[0][file]": subdir,
+                    }).toString(),
+                });
+                console.log(`[install] suppression dossier ${installDir} status=${delRes.status}`);
             } catch (e) {
-                console.log(`[install] vidage dossier ignoré:`, e);
+                console.log(`[install] suppression dossier ignorée:`, e);
             }
             await sleep(1000);
         }
@@ -320,6 +309,22 @@ export async function POST(req: NextRequest) {
                 console.log(`[install] polling ${i+1}/8 adminUrl=`, adminUrl);
             }
             if (await findInstallation(baseUrl, cookie, targetDomain)) {
+                // PrestaShop : supprimer le dossier /install (bloque l'accès admin sinon)
+                if (app === "prestashop") {
+                    try {
+                        await fetch(`${baseUrl}/execute/Fileman/remove_files`, {
+                            method: "POST",
+                            headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" },
+                            body: new URLSearchParams({
+                                "files[0][path]": installDir,
+                                "files[0][file]": "install",
+                            }).toString(),
+                        });
+                        console.log(`[install] dossier install supprimé dans ${installDir}`);
+                    } catch (e) {
+                        console.log(`[install] suppression install ignorée:`, e);
+                    }
+                }
                 // Déclencher AutoSSL en arrière-plan
                 startAutoSSLCheck(user).catch(() => {});
                 return NextResponse.json({
