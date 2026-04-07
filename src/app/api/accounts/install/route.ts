@@ -63,27 +63,45 @@ async function findInstallation(baseUrl: string, cookie: string, domain: string)
     return (await findInstallationId(baseUrl, cookie, domain)) !== null;
 }
 
-// Cherche l'ID de l'app dans la liste Softaculous (varie selon le serveur)
+// Cherche l'ID de l'app en lisant le SID depuis les installations existantes
+// L'insid Softaculous a le format "SID_INSTALLID" — le SID est l'ID du script
 async function findAppId(baseUrl: string, cookie: string, app: string): Promise<number | null> {
     const keywords = APP_KEYWORDS[app] ?? [app];
     const res = await fetch(
-        `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=scripts&api=json`,
+        `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=installations&api=json`,
         { headers: { Cookie: cookie } }
     );
     if (!res.ok) return null;
-    const text = await res.text();
-    const data = parseMaybeJson(text);
-    if (!data) return null;
+    const data = parseMaybeJson(await res.text());
+    const installations = extractSoftaculousInstallations(data);
 
-    // La liste des scripts peut être dans data.scripts ou data.data.scripts
-    const scripts = (data.scripts ?? (data.data as Record<string, unknown>)?.scripts) as Record<string, unknown> | undefined;
+    // Chercher une installation existante dont le nom contient le keyword de l'app
+    for (const [insid, install] of Object.entries(installations)) {
+        const name = (install.softname ?? install.script_name ?? "").toLowerCase();
+        if (keywords.some(kw => name.includes(kw))) {
+            // insid = "SID_INSTALLID" ou juste "SID"
+            const sid = parseInt(insid.split("_")[0], 10);
+            if (!isNaN(sid)) {
+                console.log(`[install] trouvé SID=${sid} via installation existante "${name}" (insid=${insid})`);
+                return sid;
+            }
+        }
+    }
+
+    // Fallback : chercher dans la liste des scripts HTML
+    const scriptsRes = await fetch(
+        `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=scripts&api=json`,
+        { headers: { Cookie: cookie } }
+    );
+    if (!scriptsRes.ok) return null;
+    const scriptsData = parseMaybeJson(await scriptsRes.text());
+    if (!scriptsData) return null;
+    const scripts = (scriptsData.scripts ?? (scriptsData.data as Record<string, unknown>)?.scripts) as Record<string, unknown> | undefined;
     if (!scripts) return null;
-
     for (const [idStr, script] of Object.entries(scripts)) {
         const s = script as Record<string, unknown>;
-        const name = (typeof s.name === "string" ? s.name : "").toLowerCase();
-        const softname = (typeof s.softname === "string" ? s.softname : "").toLowerCase();
-        if (keywords.some(kw => name.includes(kw) || softname.includes(kw))) {
+        const name = (typeof s.name === "string" ? s.name : typeof s.softname === "string" ? s.softname : "").toLowerCase();
+        if (keywords.some(kw => name.includes(kw))) {
             const id = parseInt(idStr, 10);
             if (!isNaN(id)) return id;
         }
