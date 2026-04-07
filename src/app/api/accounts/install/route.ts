@@ -184,21 +184,33 @@ export async function POST(req: NextRequest) {
             console.log(`[install] removeStatus=${removeRes.status} removeText=`, removeText.slice(0, 300));
             await sleep(3000);
 
-            // Vider le dossier cible via cPanel Fileman pour éviter "some_files_exist"
-            // On supprime le dossier puis on le recrée vide
+            // Vider le contenu du dossier cible via cPanel Fileman pour éviter "some_files_exist"
             const subdir = targetDomain.split(".")[0]; // ex: "testpresta"
             try {
-                await fetch(
-                    `${baseUrl}/execute/Fileman/remove_files`,
-                    {
-                        method: "POST",
-                        headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" },
-                        body: new URLSearchParams({ "files[0][path]": "public_html", "files[0][file]": subdir }).toString(),
-                    }
+                // Lister les fichiers du dossier
+                const listRes = await fetch(
+                    `${baseUrl}/execute/Fileman/list_files?dir=public_html%2F${subdir}&include_mime=0`,
+                    { headers: { Cookie: cookie } }
                 );
-                console.log(`[install] dossier public_html/${subdir} supprimé`);
+                if (listRes.ok) {
+                    const listData = await listRes.json() as { data?: { files?: { file: string }[] } };
+                    const files = listData?.data?.files ?? [];
+                    if (files.length > 0) {
+                        const params = new URLSearchParams();
+                        files.forEach((f, i) => {
+                            params.set(`files[${i}][path]`, `public_html/${subdir}`);
+                            params.set(`files[${i}][file]`, f.file);
+                        });
+                        await fetch(`${baseUrl}/execute/Fileman/remove_files`, {
+                            method: "POST",
+                            headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" },
+                            body: params.toString(),
+                        });
+                        console.log(`[install] ${files.length} fichiers supprimés dans public_html/${subdir}`);
+                    }
+                }
             } catch (e) {
-                console.log(`[install] suppression dossier ignorée:`, e);
+                console.log(`[install] vidage dossier ignoré:`, e);
             }
             await sleep(1000);
         }
