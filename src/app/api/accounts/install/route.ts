@@ -101,18 +101,37 @@ export async function POST(req: NextRequest) {
         const existingInsid = await findInstallationId(baseUrl, cookie, targetDomain);
         console.log(`[install] existingInsid=${existingInsid}`);
         if (existingInsid) {
+            // 1. Charger le formulaire de suppression pour extraire les champs cachés
+            const removeFormRes = await fetch(
+                `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=remove&insid=${encodeURIComponent(existingInsid)}`,
+                { headers: { Cookie: cookie } }
+            );
+            const removeFormHtml = removeFormRes.ok ? await removeFormRes.text() : "";
+
+            // Extraire tous les champs hidden du formulaire
+            const hiddenFields: Record<string, string> = {};
+            const hiddenRegex = /<input[^>]+type=["']hidden["'][^>]*>/gi;
+            let hMatch: RegExpExecArray | null;
+            while ((hMatch = hiddenRegex.exec(removeFormHtml)) !== null) {
+                const nameM = hMatch[0].match(/name=["']([^"']+)["']/i);
+                const valM = hMatch[0].match(/value=["']([^"']*)["']/i);
+                if (nameM?.[1]) hiddenFields[nameM[1]] = valM?.[1] ?? "";
+            }
+            console.log(`[install] removeFormFields=`, hiddenFields);
+
+            // 2. Soumettre la suppression avec les champs du formulaire
             const removeParams = new URLSearchParams({
+                ...hiddenFields,
                 softsubmit: "1",
                 removedb: "1",
                 removedir: "1",
-                insid: existingInsid,
             });
             const removeRes = await fetch(
-                `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=remove&insid=${encodeURIComponent(existingInsid)}&softsubmit=1&removedb=1&removedir=1&api=json`,
+                `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=remove&insid=${encodeURIComponent(existingInsid)}&api=json`,
                 { method: "POST", headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded" }, body: removeParams.toString() }
             );
             const removeText = await removeRes.text();
-            console.log(`[install] removeStatus=${removeRes.status} removeText=`, removeText.slice(0, 300));
+            console.log(`[install] removeStatus=${removeRes.status} removeText=`, removeText.slice(0, 400));
             await sleep(5000);
         }
 
