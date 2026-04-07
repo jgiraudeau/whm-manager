@@ -247,21 +247,65 @@ export async function POST(req: NextRequest) {
         if (!installRes.ok) throw new Error(`Installation échouée (HTTP ${installRes.status})`);
 
         const siteUrl = `https://${targetDomain}`;
-        const adminUrl = app === "wordpress" ? `${siteUrl}/wp-admin` : `${siteUrl}/admin`;
+        // WP : /wp-admin fixe. PS : dossier aléatoire, on le lit depuis Softaculous
+        let adminUrl = app === "wordpress" ? `${siteUrl}/wp-admin` : null;
+
+        // Lire adminurl depuis la réponse directe si disponible
+        if (app === "prestashop") {
+            const data = installData?.data as Record<string, unknown> | undefined;
+            const raw = installData?.admin_url ?? data?.admin_url ?? installData?.adminurl ?? data?.adminurl;
+            if (typeof raw === "string" && raw) {
+                adminUrl = raw.startsWith("http") ? raw : `${siteUrl}/${raw.replace(/^\//, "")}`;
+            }
+        }
+
+        // Fonction pour lire adminurl depuis la liste des installations
+        const getAdminUrlFromInstallations = async (): Promise<string | null> => {
+            const res = await fetch(
+                `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=installations&api=json`,
+                { headers: { Cookie: cookie } }
+            );
+            if (!res.ok) return null;
+            const data = parseMaybeJson(await res.text());
+            const installations = extractSoftaculousInstallations(data);
+            const targetHost = normalizeHost(targetDomain);
+            for (const install of Object.values(installations)) {
+                if (normalizeHost(install.softurl ?? install.domain ?? "") === targetHost) {
+                    const raw = (install as Record<string, unknown>).adminurl as string | undefined;
+                    if (raw) return raw.startsWith("http") ? raw : `${siteUrl}/${raw.replace(/^\//, "")}`;
+                }
+            }
+            return null;
+        };
 
         if (installData?.done === true) {
+            // PrestaShop prend 2-5 min — polling pour récupérer l'adminurl réel
+            if (app === "prestashop" && !adminUrl) {
+                for (let i = 0; i < 6; i++) {
+                    await sleep(5000);
+                    const found = await getAdminUrlFromInstallations();
+                    if (found) { adminUrl = found; break; }
+                }
+            }
             return NextResponse.json({
-                success: true, pending: true, app: appName, siteUrl, adminUrl,
+                success: true, pending: !adminUrl, app: appName, siteUrl,
+                adminUrl: adminUrl ?? `${siteUrl}/admin`,
                 adminUser, adminPass, adminEmail: adminEmailFinal,
-                message: `Installation de ${appName} lancée sur ${targetDomain}. Le site sera disponible dans quelques minutes.`,
+                message: adminUrl
+                    ? `${appName} installé sur ${targetDomain}`
+                    : `Installation de ${appName} lancée sur ${targetDomain}. Le site sera disponible dans quelques minutes.`,
             });
         }
 
         for (let attempt = 0; attempt < 6; attempt++) {
             await sleep(5000);
+            if (!adminUrl && app === "prestashop") {
+                adminUrl = await getAdminUrlFromInstallations();
+            }
             if (await findInstallation(baseUrl, cookie, targetDomain)) {
                 return NextResponse.json({
-                    success: true, pending: false, app: appName, siteUrl, adminUrl,
+                    success: true, pending: false, app: appName, siteUrl,
+                    adminUrl: adminUrl ?? `${siteUrl}/wp-admin`,
                     adminUser, adminPass, adminEmail: adminEmailFinal,
                     message: `${appName} installé sur ${targetDomain}`,
                 });
@@ -269,7 +313,8 @@ export async function POST(req: NextRequest) {
         }
 
         return NextResponse.json({
-            success: true, pending: true, app: appName, siteUrl, adminUrl,
+            success: true, pending: true, app: appName, siteUrl,
+            adminUrl: adminUrl ?? `${siteUrl}/admin`,
             adminUser, adminPass, adminEmail: adminEmailFinal,
             message: `Installation lancée sur ${targetDomain}. Vérifiez dans quelques minutes.`,
         });
