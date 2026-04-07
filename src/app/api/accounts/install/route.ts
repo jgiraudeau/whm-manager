@@ -48,20 +48,34 @@ function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function findInstallation(baseUrl: string, cookie: string, domain: string): Promise<boolean> {
+async function findInstallationId(baseUrl: string, cookie: string, domain: string): Promise<string | null> {
     const targetHost = normalizeHost(domain);
     const res = await fetch(
         `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=installations&api=json`,
         { headers: { Cookie: cookie } }
     );
-    if (!res.ok) return false;
+    if (!res.ok) return null;
     const text = await res.text();
     const data = parseMaybeJson(text);
     const installations = extractSoftaculousInstallations(data);
-    return Object.values(installations).some((install) => {
+    for (const [id, install] of Object.entries(installations)) {
         const host = normalizeHost(install.softurl ?? install.domain ?? "");
-        return host === targetHost;
-    });
+        if (host === targetHost) return id;
+    }
+    return null;
+}
+
+async function uninstallExisting(baseUrl: string, cookie: string, insid: string): Promise<void> {
+    await fetch(
+        `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=remove&insid=${encodeURIComponent(insid)}&removedb=1&removedir=1&api=json`,
+        { method: "POST", headers: { Cookie: cookie } }
+    );
+    // Attendre que Softaculous finalise la suppression
+    await sleep(3000);
+}
+
+async function findInstallation(baseUrl: string, cookie: string, domain: string): Promise<boolean> {
+    return (await findInstallationId(baseUrl, cookie, domain)) !== null;
 }
 
 export async function POST(req: NextRequest) {
@@ -90,6 +104,12 @@ export async function POST(req: NextRequest) {
 
         const { host, cpsess, cookie } = await getCPanelSessionData(user);
         const baseUrl = `https://${host}:2083/${cpsess}`;
+
+        // Si une installation existe déjà sur ce domaine, la supprimer d'abord
+        const existingInsid = await findInstallationId(baseUrl, cookie, targetDomain);
+        if (existingInsid) {
+            await uninstallExisting(baseUrl, cookie, existingInsid);
+        }
 
         const adminUser = "admin";
         const adminPass = generateSecurePassword();
