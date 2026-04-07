@@ -7,6 +7,7 @@ export interface SoftaculousInstallation {
   domain?: string;
   softpath?: string;
   ver?: string;
+  adminurl?: string;
 }
 
 function asRecord(value: unknown): UnknownRecord | null {
@@ -75,6 +76,7 @@ function sanitizeInstallation(value: unknown): SoftaculousInstallation | null {
     domain: isString(record.domain) ? record.domain : undefined,
     softpath: isString(record.softpath) ? record.softpath : undefined,
     ver: isString(record.ver) ? record.ver : undefined,
+    adminurl: isString(record.adminurl) ? record.adminurl : undefined,
   };
 }
 

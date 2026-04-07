@@ -224,7 +224,6 @@ export async function POST(req: NextRequest) {
             admin_email: adminEmailFinal,
             language: "en",
             site_name: app === "wordpress" ? "Mon Site WordPress" : "Ma Boutique PrestaShop",
-            overwrite_existing: "1",
             php_version_select: "1",
             cookie_key: generateSecurePassword() + generateSecurePassword(),
             ...(softStatusKey ? { soft_status_key: softStatusKey } : {}),
@@ -271,7 +270,7 @@ export async function POST(req: NextRequest) {
             const targetHost = normalizeHost(targetDomain);
             for (const install of Object.values(installations)) {
                 if (normalizeHost(install.softurl ?? install.domain ?? "") === targetHost) {
-                    const raw = (install as Record<string, unknown>).adminurl as string | undefined;
+                    const raw = install.adminurl;
                     if (raw) return raw.startsWith("http") ? raw : `${siteUrl}/${raw.replace(/^\//, "")}`;
                 }
             }
