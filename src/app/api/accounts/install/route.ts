@@ -91,12 +91,6 @@ export async function POST(req: NextRequest) {
         const { host, cpsess, cookie } = await getCPanelSessionData(user);
         const baseUrl = `https://${host}:2083/${cpsess}`;
 
-        // Vérifier qu'une installation n'existe pas déjà sur ce domaine
-        const alreadyExists = await findInstallation(baseUrl, cookie, targetDomain);
-        if (alreadyExists) {
-            return NextResponse.json({ error: `Une installation existe déjà sur ${targetDomain}` }, { status: 409 });
-        }
-
         const adminUser = "admin";
         const adminPass = generateSecurePassword();
         const adminEmailFinal = adminEmail || "admin@" + targetDomain;
