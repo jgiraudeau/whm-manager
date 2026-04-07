@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getCPanelSessionData } from "@/lib/whm";
+import { getCPanelSessionData, startAutoSSLCheck } from "@/lib/whm";
 import { ensureAccountAccess, requireAuthSession, safeError } from "@/lib/auth";
 import { isValidCpanelUsername } from "@/lib/validators";
 import { extractSoftaculousError, extractSoftaculousInstallations, normalizeHost } from "@/lib/softaculous";
@@ -270,7 +270,7 @@ export async function POST(req: NextRequest) {
         const rawText = await installRes.text();
         const installData = parseMaybeJson(rawText);
         console.log(`[install] app=${app} appId=${appId} domain=${targetDomain} status=${installRes.status}`);
-        console.log(`[install] rawText=`, rawText.slice(0, 500));
+        console.log(`[install] rawText=`, rawText.slice(0, 800));
 
         const softaculousError = extractSoftaculousError(installData);
         if (softaculousError) throw new Error(softaculousError);
@@ -283,9 +283,13 @@ export async function POST(req: NextRequest) {
         // Lire adminurl depuis la réponse directe si disponible
         if (app === "prestashop") {
             const data = installData?.data as Record<string, unknown> | undefined;
-            const raw = installData?.admin_url ?? data?.admin_url ?? installData?.adminurl ?? data?.adminurl;
+            const raw = installData?.admin_url ?? data?.admin_url ?? installData?.adminurl ?? data?.adminurl
+                ?? installData?.softpath ?? data?.softpath;
+            console.log(`[install] adminurl raw=`, raw, `user_ins=`, JSON.stringify(installData?.user_ins ?? "").slice(0, 200));
             if (typeof raw === "string" && raw) {
-                adminUrl = raw.startsWith("http") ? raw : `${siteUrl}/${raw.replace(/^\//, "")}`;
+                // Softaculous retourne parfois "adminXXX/index.php" — extraire juste le dossier
+                const folder = raw.replace(/\/index\.php.*$/, "").replace(/^\//, "");
+                adminUrl = folder.startsWith("http") ? folder : `${siteUrl}/${folder}`;
             }
         }
 
@@ -308,31 +312,16 @@ export async function POST(req: NextRequest) {
             return null;
         };
 
-        if (installData?.done === true) {
-            // PrestaShop prend 2-5 min — polling pour récupérer l'adminurl réel
-            if (app === "prestashop" && !adminUrl) {
-                for (let i = 0; i < 6; i++) {
-                    await sleep(5000);
-                    const found = await getAdminUrlFromInstallations();
-                    if (found) { adminUrl = found; break; }
-                }
-            }
-            return NextResponse.json({
-                success: true, pending: !adminUrl, app: appName, siteUrl,
-                adminUrl: adminUrl ?? `${siteUrl}/admin`,
-                adminUser, adminPass, adminEmail: adminEmailFinal,
-                message: adminUrl
-                    ? `${appName} installé sur ${targetDomain}`
-                    : `Installation de ${appName} lancée sur ${targetDomain}. Le site sera disponible dans quelques minutes.`,
-            });
-        }
-
-        for (let attempt = 0; attempt < 6; attempt++) {
+        // Polling pour confirmer l'installation et récupérer l'adminurl réel
+        for (let i = 0; i < 8; i++) {
             await sleep(5000);
             if (!adminUrl && app === "prestashop") {
                 adminUrl = await getAdminUrlFromInstallations();
+                console.log(`[install] polling ${i+1}/8 adminUrl=`, adminUrl);
             }
             if (await findInstallation(baseUrl, cookie, targetDomain)) {
+                // Déclencher AutoSSL en arrière-plan
+                startAutoSSLCheck(user).catch(() => {});
                 return NextResponse.json({
                     success: true, pending: false, app: appName, siteUrl,
                     adminUrl: adminUrl ?? `${siteUrl}/wp-admin`,
@@ -342,11 +331,13 @@ export async function POST(req: NextRequest) {
             }
         }
 
+        // Timeout — installation probablement en cours côté serveur
+        startAutoSSLCheck(user).catch(() => {});
         return NextResponse.json({
             success: true, pending: true, app: appName, siteUrl,
             adminUrl: adminUrl ?? `${siteUrl}/admin`,
             adminUser, adminPass, adminEmail: adminEmailFinal,
-            message: `Installation lancée sur ${targetDomain}. Vérifiez dans quelques minutes.`,
+            message: `Installation lancée sur ${targetDomain}. Le site sera disponible dans quelques minutes.`,
         });
 
     } catch (error: unknown) {
