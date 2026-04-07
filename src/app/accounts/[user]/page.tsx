@@ -489,6 +489,7 @@ export default function AccountDetailPage() {
                             { label: "🔧 URL admin", key: "adminUrl", value: installResult.adminUrl },
                             { label: "👤 Login", key: "adminUser", value: installResult.adminUser },
                             { label: "🔑 Mot de passe", key: "adminPass", value: installResult.adminPass },
+                            { label: "📧 Email admin", key: "adminEmail", value: installResult.adminEmail },
                         ].map(({ label, key, value }) => (
                             <div key={key} className="flex items-center justify-between bg-gray-800 rounded-lg px-4 py-2.5 group">
                                 <div className="min-w-0">
