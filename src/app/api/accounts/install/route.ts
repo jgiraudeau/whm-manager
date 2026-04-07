@@ -80,49 +80,77 @@ async function findInstallation(baseUrl: string, cookie: string, domain: string)
     return (await findInstallationId(baseUrl, cookie, domain)) !== null;
 }
 
-// Cherche l'ID de l'app en lisant le SID depuis les installations existantes
-// L'insid Softaculous a le format "SID_INSTALLID" — le SID est l'ID du script
+// Cherche l'ID de l'app Softaculous (SID) via 3 approches successives
 async function findAppId(baseUrl: string, cookie: string, app: string): Promise<number | null> {
     const keywords = APP_KEYWORDS[app] ?? [app];
-    const res = await fetch(
+
+    // 1. Installations existantes — insid format "SID_INSTALLID"
+    const instRes = await fetch(
         `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=installations&api=json`,
         { headers: { Cookie: cookie } }
     );
-    if (!res.ok) return null;
-    const data = parseMaybeJson(await res.text());
-    const installations = extractSoftaculousInstallations(data);
-
-    // Chercher une installation existante dont le nom contient le keyword de l'app
-    for (const [insid, install] of Object.entries(installations)) {
-        const name = (install.softname ?? install.script_name ?? "").toLowerCase();
-        if (keywords.some(kw => name.includes(kw))) {
-            // insid = "SID_INSTALLID" ou juste "SID"
-            const sid = parseInt(insid.split("_")[0], 10);
-            if (!isNaN(sid)) {
-                console.log(`[install] trouvé SID=${sid} via installation existante "${name}" (insid=${insid})`);
-                return sid;
+    if (instRes.ok) {
+        const data = parseMaybeJson(await instRes.text());
+        const installations = extractSoftaculousInstallations(data);
+        for (const [insid, install] of Object.entries(installations)) {
+            const name = (install.softname ?? install.script_name ?? "").toLowerCase();
+            if (keywords.some(kw => name.includes(kw))) {
+                const sid = parseInt(insid.split("_")[0], 10);
+                if (!isNaN(sid)) {
+                    console.log(`[findAppId] SID=${sid} via installation existante "${name}"`);
+                    return sid;
+                }
             }
         }
     }
 
-    // Fallback : chercher dans la liste des scripts HTML
+    // 2. Page HTML principale Softaculous — liens ?soft=NNN à côté du nom
+    const mainRes = await fetch(
+        `${baseUrl}/frontend/jupiter/softaculous/index.live.php`,
+        { headers: { Cookie: cookie } }
+    );
+    if (mainRes.ok) {
+        const html = await mainRes.text();
+        for (const kw of keywords) {
+            // Cherche "soft=NNN" dans les 300 chars avant ou après le keyword
+            const re = new RegExp(`soft=(\\d+)[\\s\\S]{0,300}${kw}|${kw}[\\s\\S]{0,300}soft=(\\d+)`, "i");
+            const m = html.match(re);
+            const sid = m ? parseInt(m[1] ?? m[2], 10) : NaN;
+            if (!isNaN(sid)) {
+                console.log(`[findAppId] SID=${sid} via page HTML pour "${kw}"`);
+                return sid;
+            }
+        }
+        console.log(`[findAppId] HTML: rien trouvé pour ${app}, longueur=${html.length}`);
+    }
+
+    // 3. API act=scripts
     const scriptsRes = await fetch(
         `${baseUrl}/frontend/jupiter/softaculous/index.live.php?act=scripts&api=json`,
         { headers: { Cookie: cookie } }
     );
-    if (!scriptsRes.ok) return null;
-    const scriptsData = parseMaybeJson(await scriptsRes.text());
-    if (!scriptsData) return null;
-    const scripts = (scriptsData.scripts ?? (scriptsData.data as Record<string, unknown>)?.scripts) as Record<string, unknown> | undefined;
-    if (!scripts) return null;
-    for (const [idStr, script] of Object.entries(scripts)) {
-        const s = script as Record<string, unknown>;
-        const name = (typeof s.name === "string" ? s.name : typeof s.softname === "string" ? s.softname : "").toLowerCase();
-        if (keywords.some(kw => name.includes(kw))) {
-            const id = parseInt(idStr, 10);
-            if (!isNaN(id)) return id;
+    if (scriptsRes.ok) {
+        const scriptsText = await scriptsRes.text();
+        console.log(`[findAppId] scripts raw=`, scriptsText.slice(0, 400));
+        const scriptsData = parseMaybeJson(scriptsText);
+        const scripts = scriptsData
+            ? ((scriptsData.scripts ?? (scriptsData.data as Record<string, unknown>)?.scripts) as Record<string, unknown> | undefined)
+            : undefined;
+        if (scripts) {
+            for (const [idStr, script] of Object.entries(scripts)) {
+                const s = script as Record<string, unknown>;
+                const name = (typeof s.name === "string" ? s.name : typeof s.softname === "string" ? s.softname : "").toLowerCase();
+                if (keywords.some(kw => name.includes(kw))) {
+                    const id = parseInt(idStr, 10);
+                    if (!isNaN(id)) {
+                        console.log(`[findAppId] SID=${id} via API scripts`);
+                        return id;
+                    }
+                }
+            }
         }
     }
+
     return null;
 }
 
@@ -153,10 +181,11 @@ export async function POST(req: NextRequest) {
         const baseUrl = `https://${host}:2083/${cpsess}`;
 
         // Chercher l'ID de l'app dynamiquement
-        let appId = await findAppId(baseUrl, cookie, app);
-        console.log(`[install] appId dynamique pour ${app}=${appId}`);
-        // Fallback IDs connus
-        if (!appId) appId = app === "wordpress" ? 26 : 29;
+        const appId = await findAppId(baseUrl, cookie, app);
+        console.log(`[install] appId pour ${app}=${appId}`);
+        if (!appId) {
+            return NextResponse.json({ error: `${appName} introuvable dans Softaculous. Installez-en une instance manuellement d'abord.` }, { status: 400 });
+        }
 
         const subdir = targetDomain.split(".")[0]; // ex: "testpresta"
         const installDir = `public_html/${subdir}`;
