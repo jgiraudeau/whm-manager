@@ -12,10 +12,27 @@ const APP_KEYWORDS: Record<string, string[]> = {
 const DOMAIN_RE = /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}$/i;
 
 function generateSecurePassword(): string {
-    const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%&";
+    const lower = "abcdefghijklmnopqrstuvwxyz";
+    const upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const digits = "0123456789";
+    const special = "!@#$%&";
+    const all = lower + upper + digits + special;
     const bytes = new Uint8Array(12);
     crypto.getRandomValues(bytes);
-    return Array.from(bytes, (b) => charset[b % charset.length]).join("");
+    // Garantit au moins un de chaque type
+    const pwd = [
+        lower[bytes[0] % lower.length],
+        upper[bytes[1] % upper.length],
+        digits[bytes[2] % digits.length],
+        special[bytes[3] % special.length],
+        ...Array.from(bytes.slice(4), (b) => all[b % all.length]),
+    ];
+    // Mélanger
+    for (let i = pwd.length - 1; i > 0; i--) {
+        const j = bytes[i % bytes.length] % (i + 1);
+        [pwd[i], pwd[j]] = [pwd[j], pwd[i]];
+    }
+    return pwd.join("");
 }
 
 function parseMaybeJson(input: string): Record<string, unknown> | null {
