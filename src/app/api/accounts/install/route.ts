@@ -221,8 +221,22 @@ export async function POST(req: NextRequest) {
         const siteUrl = `https://${targetDomain}`;
         const adminUrl = app === "wordpress" ? `${siteUrl}/wp-admin` : `${siteUrl}/admin`;
 
-        // Toujours vérifier dans la liste des installations — Softaculous peut mentir sur done
-        // Attendre jusqu'à 30s (6 tentatives × 5s)
+        // Si Softaculous confirme done:true, on retourne immédiatement (PrestaShop peut prendre 2-5 min)
+        if (installData?.done === true) {
+            return NextResponse.json({
+                success: true,
+                pending: true,
+                app: appConfig.name,
+                siteUrl,
+                adminUrl,
+                adminUser,
+                adminPass,
+                adminEmail: adminEmailFinal,
+                message: `Installation de ${appConfig.name} lancée sur ${targetDomain}. Le site sera disponible dans quelques minutes.`,
+            });
+        }
+
+        // Sinon polling court (WordPress se finit rapidement)
         for (let attempt = 0; attempt < 6; attempt++) {
             await sleep(5000);
             const found = await findInstallation(baseUrl, cookie, targetDomain);
@@ -241,7 +255,6 @@ export async function POST(req: NextRequest) {
             }
         }
 
-        // Après 30s sans confirmation : installation peut encore être en cours
         const taskId =
             typeof installData?.taskid === "string" ? installData.taskid :
             typeof installData?.task_id === "string" ? installData.task_id : null;
