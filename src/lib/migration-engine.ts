@@ -68,19 +68,46 @@ async function uploadFileToCpanel(
   if (errors && Array.isArray(errors) && errors.length > 0) {
     throw new Error(`cPanel upload error: ${errors[0]}`);
   }
+
+  // Set permissions to 0644 to ensure it's readable and executable by the webserver
+  try {
+    await cpanelApi(user, "Fileman", "set_file_perms", {
+      dir: destDir,
+      file: fileName,
+      perms: "0755",
+    });
+  } catch {
+    // ignore if fails
+  }
 }
 
 /**
- * Delete a file from a cPanel account via UAPI Fileman.
+ * Create a directory on a cPanel account via UAPI Fileman.
  */
-async function deleteFileFromCpanel(user: string, fullPath: string): Promise<void> {
+async function createDirectoryCpanel(user: string, path: string): Promise<void> {
+  try {
+    const parentDir = path.slice(0, path.lastIndexOf("/"));
+    const newDir = path.slice(path.lastIndexOf("/") + 1);
+    await cpanelApi(user, "Fileman", "mkdir", {
+      path: parentDir,
+      name: newDir,
+    });
+  } catch {
+    // ignore if already exists
+  }
+}
+
+/**
+ * Delete a file or directory from a cPanel account via UAPI Fileman.
+ */
+async function deleteFromCpanel(user: string, fullPath: string, type: "file" | "dir" = "file"): Promise<void> {
   try {
     const dir = fullPath.slice(0, fullPath.lastIndexOf("/"));
     const file = fullPath.slice(fullPath.lastIndexOf("/") + 1);
     await cpanelApi(user, "Fileman", "delete_files", {
       "files-0-dir": dir,
       "files-0-file": file,
-      "files-0-type": "file",
+      "files-0-type": type,
       "files-0-path": fullPath,
     });
   } catch {
@@ -556,14 +583,23 @@ export async function deployPackerAgent(
   appType: AppType,
 ): Promise<DeployPackerResult> {
   const token = randomToken(32);
-  const fileName = `whm-packer-${randomToken(8)}.php`;
+  const dirName = `.wp-migrator-${randomToken(6)}`;
+  const fileName = `agent.php`;
+  const agentPath = `${sourcePath}/${dirName}`;
+
+  // 1. Create directory
+  await createDirectoryCpanel(sourceUser, agentPath);
+
+  // 2. Upload .htaccess to force PHP execution
+  const htaccess = `<Files "*.php">\n  SetHandler application/x-httpd-php\n</Files>\n`;
+  await uploadFileToCpanel(sourceUser, agentPath, ".htaccess", htaccess);
+
+  // 3. Upload Agent
   const content = buildPackerPhp(token, sourcePath, appType);
+  await uploadFileToCpanel(sourceUser, agentPath, fileName, content);
 
-  await uploadFileToCpanel(sourceUser, sourcePath, fileName, content);
-
-  // Determine public URL — strip trailing slash from baseUrl
   const base = sourceBaseUrl.replace(/\/$/, "");
-  const packerPublicUrl = `${base}/${fileName}`;
+  const packerPublicUrl = `${base}/${dirName}/${fileName}`;
 
   return { packerFileName: fileName, packerToken: token, packerPublicUrl };
 }
@@ -620,9 +656,20 @@ export async function deployUnpackerAgent(params: {
   newDbPass: string;
   newSiteUrl: string;
   oldSiteUrl: string;
-}): Promise<{ unpackerFileName: string; unpackerToken: string }> {
+}): Promise<{ unpackerFileName: string; unpackerToken: string; unpackerDir: string }> {
   const token = randomToken(32);
-  const fileName = `whm-unpacker-${randomToken(8)}.php`;
+  const dirName = `.wp-engine-${randomToken(6)}`;
+  const fileName = `agent.php`;
+  const agentPath = `${params.destPath}/${dirName}`;
+
+  // 1. Create directory
+  await createDirectoryCpanel(params.targetUser, agentPath);
+
+  // 2. Upload .htaccess
+  const htaccess = `<Files "*.php">\n  SetHandler application/x-httpd-php\n</Files>\n`;
+  await uploadFileToCpanel(params.targetUser, agentPath, ".htaccess", htaccess);
+
+  // 3. Upload Agent
   const content = buildUnpackerPhp({
     token,
     packerUrl: params.packerUrl,
@@ -636,9 +683,9 @@ export async function deployUnpackerAgent(params: {
     oldSiteUrl: params.oldSiteUrl,
   });
 
-  await uploadFileToCpanel(params.targetUser, params.destPath, fileName, content);
+  await uploadFileToCpanel(params.targetUser, agentPath, fileName, content);
 
-  return { unpackerFileName: fileName, unpackerToken: token };
+  return { unpackerFileName: fileName, unpackerToken: token, unpackerDir: dirName };
 }
 
 /**
@@ -672,19 +719,19 @@ export async function callUnpackerUnpack(
 export async function cleanupAgents(params: {
   sourceUser: string;
   sourcePath: string;
-  packerFileName: string;
+  packerDir: string;
   packerUrl: string;
   packerToken: string;
   targetUser: string;
   destPath: string;
-  unpackerFileName: string;
+  unpackerDir: string;
 }): Promise<void> {
   await Promise.allSettled([
-    // Try cleanup via HTTP first (packer self-deletes)
+    // Try cleanup via HTTP first (packer self-deletes its ZIP)
     fetch(`${params.packerUrl}?token=${params.packerToken}&action=cleanup`).catch(() => null),
-    // Fallback: delete via cPanel API
-    deleteFileFromCpanel(params.sourceUser, `${params.sourcePath}/${params.packerFileName}`),
-    deleteFileFromCpanel(params.targetUser, `${params.destPath}/${params.unpackerFileName}`),
+    // Delete full directories via cPanel API
+    deleteFromCpanel(params.sourceUser, `${params.sourcePath}/${params.packerDir}`, "dir"),
+    deleteFromCpanel(params.targetUser, `${params.destPath}/${params.unpackerDir}`, "dir"),
   ]);
 }
 
@@ -717,11 +764,11 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
   const { jobId, sourceUser, sourcePath, sourceUrl, appType, target } = params;
   const { user: targetUser } = target;
 
-  let packerFileName = "";
   let packerToken = "";
   let packerUrl = "";
-  let unpackerFileName = "";
+  let packerDir = "";
   let unpackerToken = "";
+  let unpackerDir = "";
 
   try {
     await updateMigrationTarget(jobId, targetUser, {
@@ -732,10 +779,10 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
     // 1. Deploy packer
     await log(jobId, targetUser, "Déploiement de l'agent packer sur le compte source…");
     const packer = await deployPackerAgent(sourceUser, sourcePath, sourceUrl, appType);
-    packerFileName = packer.packerFileName;
+    packerDir = packer.packerPublicUrl.split("/").slice(-2, -1)[0];
     packerToken = packer.packerToken;
     packerUrl = packer.packerPublicUrl;
-    await log(jobId, targetUser, `Agent packer déployé : ${packerFileName}`);
+    await log(jobId, targetUser, `Agent packer déployé dans le dossier ${packerDir}`);
 
     // 2. Call packer to create ZIP
     await log(jobId, targetUser, "Compression des fichiers et export SQL (peut prendre 1-5 min)…");
@@ -757,13 +804,13 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
       newSiteUrl: target.newSiteUrl,
       oldSiteUrl: sourceUrl,
     });
-    unpackerFileName = unpacker.unpackerFileName;
+    unpackerDir = unpacker.unpackerDir;
     unpackerToken = unpacker.unpackerToken;
-    await log(jobId, targetUser, `Agent unpacker déployé : ${unpackerFileName}`);
+    await log(jobId, targetUser, `Agent unpacker déployé dans le dossier ${unpackerDir}`);
 
     // 4. Call unpacker (P2P transfer + restore)
     await log(jobId, targetUser, "Transfert P2P + extraction + import SQL + patch config…");
-    const unpackerPublicUrl = `${target.newSiteUrl.replace(/\/$/, "")}/${unpackerFileName}`;
+    const unpackerPublicUrl = `${target.newSiteUrl.replace(/\/$/, "")}/${unpackerDir}/agent.php`;
     const { targetUrl } = await callUnpackerUnpack(unpackerPublicUrl, unpackerToken, 20 * 60 * 1000);
     await log(jobId, targetUser, `✅ Migration terminée → ${targetUrl}`);
 
@@ -782,22 +829,21 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
     });
   } finally {
     // Always try to cleanup agents
-    if (packerFileName || unpackerFileName) {
+    if (packerDir || unpackerDir) {
       try {
         await cleanupAgents({
           sourceUser,
           sourcePath,
-          packerFileName,
+          packerDir,
           packerUrl,
           packerToken,
           targetUser,
           destPath: target.destPath,
-          unpackerFileName,
+          unpackerDir,
         });
       } catch {
         // best-effort
       }
     }
-    await sleep(500);
   }
 }
