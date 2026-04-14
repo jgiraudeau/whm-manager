@@ -3,7 +3,7 @@
 import { ReactNode, useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { FileSpreadsheet, LayoutDashboard, LogOut, PlusCircle, Server, ShieldCheck } from "lucide-react";
+import { Copy, FileSpreadsheet, LayoutDashboard, LogOut, PlusCircle, Server, ShieldCheck } from "lucide-react";
 
 interface AppShellProps {
   children: ReactNode;
@@ -92,6 +92,15 @@ export default function AppShell({ children }: AppShellProps) {
             <FileSpreadsheet className="w-4 h-4" />
             Export sites
           </Link>
+          {sessionUser?.role === "superadmin" && (
+            <Link
+              href="/admin/migrations"
+              className="flex items-center gap-3 px-4 py-2.5 rounded-lg text-gray-400 hover:text-white hover:bg-gray-800 transition-all text-sm font-medium"
+            >
+              <Copy className="w-4 h-4" />
+              Migrations
+            </Link>
+          )}
           {sessionUser?.role === "superadmin" && (
             <Link
               href="/admin/access"
