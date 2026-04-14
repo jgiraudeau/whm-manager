@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { ensureSuperAdmin, requireAuthSession, safeError } from "@/lib/auth";
+import { ensureSuperAdmin, filterAccountsForSession, requireAuthSession, safeError } from "@/lib/auth";
 import { listAccounts, cpanelApi } from "@/lib/whm";
 import { listSoftaculousInstallationsForUser } from "@/lib/softaculous-client";
 import { createMigrationJob, listMigrationJobs, deleteMigrationJob } from "@/lib/migration-store";
@@ -12,9 +12,6 @@ import { generatePassword } from "@/lib/whm";
 export async function GET(req: NextRequest) {
   const { denied, session } = await requireAuthSession(req);
   if (denied) return denied;
-
-  const forbidden = ensureSuperAdmin(session);
-  if (forbidden) return forbidden;
 
   try {
     const jobs = await listMigrationJobs();
@@ -44,8 +41,7 @@ export async function POST(req: NextRequest) {
   const { denied, session } = await requireAuthSession(req);
   if (denied) return denied;
 
-  const forbidden = ensureSuperAdmin(session);
-  if (forbidden) return forbidden;
+  // Allowed for both roles
 
   try {
     const body = (await req.json()) as LaunchBody;
@@ -72,8 +68,9 @@ export async function POST(req: NextRequest) {
     const sourcePath = sourceInstall.path; // e.g. /home/user/public_html or /home/user/public_html/subdir
     const appType = sourceInstall.app === "prestashop" ? "prestashop" : "wordpress";
 
-    // Validate targets
-    const accounts = await listAccounts();
+    // Validate targets and filter for this session
+    let accounts = await listAccounts();
+    accounts = filterAccountsForSession(session, accounts);
     const resolvedTargets: Array<{
       user: string;
       subdomain: string;
@@ -198,8 +195,7 @@ export async function DELETE(req: NextRequest) {
   const { denied, session } = await requireAuthSession(req);
   if (denied) return denied;
 
-  const forbidden = ensureSuperAdmin(session);
-  if (forbidden) return forbidden;
+  // Allowed for both roles
 
   try {
     const { id } = (await req.json()) as { id?: string };

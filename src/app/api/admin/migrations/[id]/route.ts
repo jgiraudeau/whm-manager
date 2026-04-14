@@ -9,8 +9,7 @@ export async function GET(
   const { denied, session } = await requireAuthSession(req);
   if (denied) return denied;
 
-  const forbidden = ensureSuperAdmin(session);
-  if (forbidden) return forbidden;
+  // Allowed for both roles
 
   try {
     const { id } = await params;
