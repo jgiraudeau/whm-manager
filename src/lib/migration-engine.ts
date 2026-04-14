@@ -81,16 +81,25 @@ async function uploadFileToCpanel(
   }
 }
 
+function splitPath(fullPath: string) {
+  const sanitized = fullPath.replace(/\/+$/, "");
+  const lastSlashIndex = sanitized.lastIndexOf("/");
+  if (lastSlashIndex === -1) return { dir: "", name: sanitized };
+  return {
+    dir: sanitized.slice(0, lastSlashIndex),
+    name: sanitized.slice(lastSlashIndex + 1),
+  };
+}
+
 /**
  * Create a directory on a cPanel account via UAPI Fileman.
  */
 async function createDirectoryCpanel(user: string, path: string): Promise<void> {
   try {
-    const parentDir = path.slice(0, path.lastIndexOf("/"));
-    const newDir = path.slice(path.lastIndexOf("/") + 1);
+    const { dir, name } = splitPath(path);
     await cpanelApi(user, "Fileman", "mkdir", {
-      path: parentDir,
-      name: newDir,
+      path: dir,
+      name: name,
     });
   } catch {
     // ignore if already exists
@@ -102,13 +111,12 @@ async function createDirectoryCpanel(user: string, path: string): Promise<void> 
  */
 async function deleteFromCpanel(user: string, fullPath: string, type: "file" | "dir" = "file"): Promise<void> {
   try {
-    const dir = fullPath.slice(0, fullPath.lastIndexOf("/"));
-    const file = fullPath.slice(fullPath.lastIndexOf("/") + 1);
+    const { dir, name } = splitPath(fullPath);
     await cpanelApi(user, "Fileman", "delete_files", {
       "files-0-dir": dir,
-      "files-0-file": file,
+      "files-0-file": name,
       "files-0-type": type,
-      "files-0-path": fullPath,
+      "files-0-path": fullPath.replace(/\/+$/, ""),
     });
   } catch {
     // best-effort
@@ -761,8 +769,13 @@ async function log(jobId: string, user: string, msg: string) {
 }
 
 export async function runMigrationForTarget(params: RunMigrationTargetParams): Promise<void> {
-  const { jobId, sourceUser, sourcePath, sourceUrl, appType, target } = params;
+  const { jobId, sourceUser, appType, target } = params;
   const { user: targetUser } = target;
+
+  // Normalize paths (no trailing slashes)
+  const sourcePath = params.sourcePath.replace(/\/+$/, "");
+  const sourceUrl = params.sourceUrl.replace(/\/+$/, "");
+  const destPath = target.destPath.replace(/\/+$/, "");
 
   let packerToken = "";
   let packerUrl = "";

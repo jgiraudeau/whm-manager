@@ -90,15 +90,20 @@ export function getCPanelURL(): string {
 async function whmFetch(endpoint: string, params: Record<string, string> = {}) {
     const { host, user, token } = getWhmConfig();
     const url = new URL(`${host}/json-api/${endpoint}`);
-    url.searchParams.set("api.version", "1");
+    
+    const body = new URLSearchParams();
+    body.set("api.version", "1");
     for (const [key, value] of Object.entries(params)) {
-        url.searchParams.set(key, value);
+        body.set(key, value);
     }
 
     const res = await fetchInsecure(url.toString(), {
+        method: "POST",
         headers: {
             Authorization: `whm ${user}:${token}`,
+            "Content-Type": "application/x-www-form-urlencoded",
         },
+        body: body.toString(),
         cache: "no-store",
     });
 
