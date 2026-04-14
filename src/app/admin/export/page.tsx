@@ -23,28 +23,17 @@ interface ExportRow {
   subdomain: string;
 }
 
-// ─── Minimal XLSX generator (no dependency) ──────────────────────────────────
+// ─── Excel SpreadsheetML generator (Excel 2003 XML — no ZIP, no binary, 100% reliable) ───
 
 function escapeXml(str: string): string {
-  return str
+  return String(str ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
+    .replace(/"/g, "&quot;");
 }
 
-function cellAddress(col: number, row: number): string {
-  let letter = "";
-  let n = col + 1;
-  while (n > 0) {
-    letter = String.fromCharCode(((n - 1) % 26) + 65) + letter;
-    n = Math.floor((n - 1) / 26);
-  }
-  return `${letter}${row}`;
-}
-
-function buildXlsx(rows: ExportRow[]): Blob {
+function buildXls(rows: ExportRow[]): Blob {
   const headers = [
     "Compte cPanel",
     "Domaine principal",
@@ -62,189 +51,47 @@ function buildXlsx(rows: ExportRow[]): Blob {
     r.subdomain || "(racine)",
     r.siteUrl,
     r.adminUrl,
-    r.version || "—",
+    r.version || "",
   ]);
 
-  const allRows = [headers, ...dataRows];
-
-  // Build shared strings
-  const strings: string[] = [];
-  const stringIndex: Map<string, number> = new Map();
-  function si(value: string): number {
-    if (!stringIndex.has(value)) {
-      stringIndex.set(value, strings.length);
-      strings.push(value);
-    }
-    return stringIndex.get(value)!;
+  function row(cells: string[], isHeader = false): string {
+    const style = isHeader ? ` ss:StyleID="Header"` : "";
+    const cellsXml = cells
+      .map((c) => `      <Cell><Data ss:Type="String">${escapeXml(c)}</Data></Cell>`)
+      .join("\n");
+    return `    <Row${style}>\n${cellsXml}\n    </Row>`;
   }
 
-  // Build worksheet XML
-  let wsData = "";
-  allRows.forEach((row, rIdx) => {
-    wsData += `<row r="${rIdx + 1}">`;
-    row.forEach((cell, cIdx) => {
-      const addr = cellAddress(cIdx, rIdx + 1);
-      const idx = si(cell);
-      wsData += `<c r="${addr}" t="s"><v>${idx}</v></c>`;
-    });
-    wsData += `</row>`;
-  });
+  const xml = [
+    `<?xml version="1.0" encoding="UTF-8"?>`,
+    `<?mso-application progid="Excel.Sheet"?>`,
+    `<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"`,
+    `  xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"`,
+    `  xmlns:x="urn:schemas-microsoft-com:office:excel">`,
+    `  <Styles>`,
+    `    <Style ss:ID="Header">`,
+    `      <Font ss:Bold="1"/>`,
+    `      <Interior ss:Color="#1F2937" ss:Pattern="Solid"/>`,
+    `      <Font ss:Color="#FFFFFF" ss:Bold="1"/>`,
+    `    </Style>`,
+    `  </Styles>`,
+    `  <Worksheet ss:Name="Inventaire Sites">`,
+    `    <Table>`,
+    `      <Column ss:Width="120"/>`,
+    `      <Column ss:Width="200"/>`,
+    `      <Column ss:Width="100"/>`,
+    `      <Column ss:Width="160"/>`,
+    `      <Column ss:Width="300"/>`,
+    `      <Column ss:Width="300"/>`,
+    `      <Column ss:Width="80"/>`,
+    row(headers, true),
+    ...dataRows.map((r) => row(r, false)),
+    `    </Table>`,
+    `  </Worksheet>`,
+    `</Workbook>`,
+  ].join("\n");
 
-  // Column widths
-  const colWidths = [15, 28, 12, 20, 45, 45, 10];
-  const cols = colWidths.map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join("");
-
-  const sheetXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/sheet">
-<cols>${cols}</cols>
-<sheetData>${wsData}</sheetData>
-</worksheet>`;
-
-  const sharedStringsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/sheet" count="${strings.length}" uniqueCount="${strings.length}">
-${strings.map((s) => `<si><t xml:space="preserve">${escapeXml(s)}</t></si>`).join("")}
-</sst>`;
-
-  const workbookXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/ml-10" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-<sheets><sheet name="Inventaire Sites" sheetId="1" r:id="rId1"/></sheets>
-</workbook>`;
-
-  const relsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
-<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
-</Relationships>`;
-
-  const contentTypesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-<Default Extension="xml" ContentType="application/xml"/>
-<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
-<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
-</Types>`;
-
-  const appRelsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
-</Relationships>`;
-
-  // Build the ZIP manually using JSZip-free approach — encode as a Uint8Array
-  function toUint8(str: string): Uint8Array {
-    return new TextEncoder().encode(str);
-  }
-
-  // Simple ZIP builder
-  function crc32(data: Uint8Array): number {
-    const table = Array.from({ length: 256 }, (_, i) => {
-      let c = i;
-      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-      return c >>> 0;
-    });
-    let crc = 0xffffffff;
-    for (const byte of data) crc = (table[(crc ^ byte) & 0xff] ^ (crc >>> 8)) >>> 0;
-    return (crc ^ 0xffffffff) >>> 0;
-  }
-
-  function uint32LE(n: number): Uint8Array {
-    return new Uint8Array([n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >> 24) & 0xff]);
-  }
-  function uint16LE(n: number): Uint8Array {
-    return new Uint8Array([n & 0xff, (n >> 8) & 0xff]);
-  }
-
-  const files: { name: string; data: Uint8Array }[] = [
-    { name: "[Content_Types].xml", data: toUint8(contentTypesXml) },
-    { name: "_rels/.rels", data: toUint8(appRelsXml) },
-    { name: "xl/workbook.xml", data: toUint8(workbookXml) },
-    { name: "xl/_rels/workbook.xml.rels", data: toUint8(relsXml) },
-    { name: "xl/worksheets/sheet1.xml", data: toUint8(sheetXml) },
-    { name: "xl/sharedStrings.xml", data: toUint8(sharedStringsXml) },
-  ];
-
-  const localHeaders: Uint8Array[] = [];
-  const centralDirs: Uint8Array[] = [];
-  let offset = 0;
-
-  for (const file of files) {
-    const nameBytes = toUint8(file.name);
-    const crc = crc32(file.data);
-    const size = file.data.length;
-    const now = new Date();
-    const dosDate =
-      (((now.getFullYear() - 1980) & 0x7f) << 9) |
-      (((now.getMonth() + 1) & 0x0f) << 5) |
-      (now.getDate() & 0x1f);
-    const dosTime =
-      ((now.getHours() & 0x1f) << 11) |
-      ((now.getMinutes() & 0x3f) << 5) |
-      ((now.getSeconds() >> 1) & 0x1f);
-
-    const localHeader = new Uint8Array([
-      0x50, 0x4b, 0x03, 0x04, // signature
-      ...uint16LE(20),         // version needed
-      ...uint16LE(0),          // flags
-      ...uint16LE(0),          // compression (stored)
-      ...uint16LE(dosTime),
-      ...uint16LE(dosDate),
-      ...uint32LE(crc),
-      ...uint32LE(size),
-      ...uint32LE(size),
-      ...uint16LE(nameBytes.length),
-      ...uint16LE(0),
-      ...nameBytes,
-    ]);
-
-    localHeaders.push(new Uint8Array([...localHeader, ...file.data]));
-
-    const centralDir = new Uint8Array([
-      0x50, 0x4b, 0x01, 0x02, // signature
-      ...uint16LE(20),         // version made by
-      ...uint16LE(20),         // version needed
-      ...uint16LE(0),          // flags
-      ...uint16LE(0),          // compression
-      ...uint16LE(dosTime),
-      ...uint16LE(dosDate),
-      ...uint32LE(crc),
-      ...uint32LE(size),
-      ...uint32LE(size),
-      ...uint16LE(nameBytes.length),
-      ...uint16LE(0),          // extra
-      ...uint16LE(0),          // comment
-      ...uint16LE(0),          // disk start
-      ...uint16LE(0),          // internal attrs
-      ...uint32LE(0),          // external attrs
-      ...uint32LE(offset),
-      ...nameBytes,
-    ]);
-
-    centralDirs.push(centralDir);
-    offset += localHeader.length + file.data.length;
-  }
-
-  const centralDirSize = centralDirs.reduce((acc, d) => acc + d.length, 0);
-  const eocd = new Uint8Array([
-    0x50, 0x4b, 0x05, 0x06,
-    ...uint16LE(0),
-    ...uint16LE(0),
-    ...uint16LE(files.length),
-    ...uint16LE(files.length),
-    ...uint32LE(centralDirSize),
-    ...uint32LE(offset),
-    ...uint16LE(0),
-  ]);
-
-  const parts = [...localHeaders, ...centralDirs, eocd];
-  const totalLength = parts.reduce((acc, p) => acc + p.length, 0);
-  const output = new Uint8Array(totalLength);
-  let pos = 0;
-  for (const part of parts) {
-    output.set(part, pos);
-    pos += part.length;
-  }
-
-  return new Blob([output], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  return new Blob([xml], { type: "application/vnd.ms-excel;charset=utf-8" });
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
@@ -274,12 +121,12 @@ export default function ExportPage() {
 
   function downloadExcel() {
     if (!rows || rows.length === 0) return;
-    const blob = buildXlsx(rows);
+    const blob = buildXls(rows);
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
     const date = new Date().toISOString().slice(0, 10);
-    a.download = `inventaire-sites-${date}.xlsx`;
+    a.download = `inventaire-sites-${date}.xls`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
