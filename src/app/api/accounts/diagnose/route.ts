@@ -125,12 +125,11 @@ export async function POST(req: NextRequest) {
     const fileName = `whm_probe_${token.slice(0, 8)}.php`;
     const probeContent = buildProbePhp(token);
 
-    // 1. Upload probe to public_html
+    // 1. Upload probe to public_html — send raw content (no base64: some cPanel servers store it literally)
     await cpanelApi(user, "Fileman", "save_file_content", {
       dir: "public_html",
       file: fileName,
-      content: Buffer.from(probeContent, "utf8").toString("base64"),
-      encoding: "base64",
+      content: probeContent,
     });
 
     // 2. Set permissions

@@ -54,14 +54,11 @@ async function uploadFileToCpanel(
   fileName: string,
   content: string,
 ): Promise<void> {
-  // We use the WHM proxy to cPanel UAPI Fileman upload_files
-  // Encode file as base64 for the JSON body
-  const encoded = Buffer.from(content, "utf8").toString("base64");
+  // Send raw content — some cPanel versions store base64 literally instead of decoding it
   const result = await cpanelApi(user, "Fileman", "save_file_content", {
     dir: destDir,
     file: fileName,
-    content: encoded,
-    encoding: "base64",
+    content,
   });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const errors = (result as any)?.result?.errors ?? (result as any)?.data?.result?.errors;
