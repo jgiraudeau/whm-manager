@@ -149,10 +149,10 @@ async function deleteFromCpanel(user: string, fullPath: string, type: "file" | "
  *
  * When called with ?token=TOKEN&action=cleanup, it deletes the ZIP + itself.
  */
-function buildPackerPhp(token: string, sourcePath: string, sourceBaseUrl: string, appType: AppType): string {
+function buildPackerPhp(token: string, sourceUser: string, sourcePath: string, appType: AppType): string {
   const escapedPath = sourcePath.replace(/'/g, "\\'");
   const escapedToken = token.replace(/'/g, "\\'");
-  const escapedBaseUrl = sourceBaseUrl.replace(/\/$/, "").replace(/'/g, "\\'");
+  const escapedUser = sourceUser.replace(/'/g, "\\'");
   const appLabel = appType === "wordpress" ? "wordpress" : "prestashop";
 
   return `<?php
@@ -163,10 +163,10 @@ ini_set('memory_limit', '512M');
 
 define('AGENT_TOKEN', '${escapedToken}');
 define('SOURCE_PATH', '${escapedPath}');
-define('ZIP_BASE_URL', '${escapedBaseUrl}');
 define('APP_TYPE', '${appLabel}');
 define('ZIP_NAME', 'whm_pack_' . substr(md5(SOURCE_PATH . AGENT_TOKEN), 0, 8) . '.zip');
-define('ZIP_PATH', SOURCE_PATH . '/' . ZIP_NAME);
+// Store ZIP in home dir (outside SOURCE_PATH) to avoid ZipArchive self-reference loop
+define('ZIP_PATH', '/home/${escapedUser}/' . ZIP_NAME);
 
 header('Content-Type: application/json');
 
@@ -334,7 +334,6 @@ if ($action === 'pack') {
     echo json_encode([
         'success'    => true,
         'zipName'    => ZIP_NAME,
-        'zipUrl'     => ZIP_BASE_URL . '/' . ZIP_NAME,
         'zipSize'    => $zipSize,
         'dbName'     => $dbName,
         'dbHost'     => $dbHost,
@@ -360,7 +359,8 @@ echo json_encode(['error' => 'Unknown action']);
  */
 function buildUnpackerPhp(params: {
   token: string;
-  zipUrl: string;
+  packerUrl: string;
+  packerToken: string;
   destPath: string;
   appType: AppType;
   newDbName: string;
@@ -376,7 +376,8 @@ set_time_limit(0);
 ini_set('memory_limit', '512M');
 
 define('AGENT_TOKEN',  '${e(params.token)}');
-define('ZIP_URL',      '${e(params.zipUrl)}');
+define('PACKER_URL',   '${e(params.packerUrl)}');
+define('PACKER_TOKEN', '${e(params.packerToken)}');
 define('DEST_PATH',    '${e(params.destPath)}');
 define('APP_TYPE',     '${params.appType}');
 define('NEW_DB_NAME',  '${e(params.newDbName)}');
@@ -407,9 +408,10 @@ if ($action !== 'unpack') {
     exit;
 }
 
-// ── Step 1: Download ZIP directly from source URL
+// ── Step 1: Download ZIP via packer download action (ZIP stored in home dir, served by packer)
 $zipPath = sys_get_temp_dir() . '/whm_unpack_' . md5(AGENT_TOKEN) . '.zip';
-$ch = curl_init(ZIP_URL);
+$downloadUrl = PACKER_URL . '?action=download&token=' . urlencode(PACKER_TOKEN);
+$ch = curl_init($downloadUrl);
 curl_setopt_array($ch, [
     CURLOPT_RETURNTRANSFER => false,
     CURLOPT_FILE           => fopen($zipPath, 'wb'),
@@ -619,7 +621,7 @@ export async function deployPackerAgent(
   const relDir = toHomeRelative(sourceUser, sourcePath);
 
   // Upload agent directly into the existing installation directory
-  const content = buildPackerPhp(token, sourcePath, sourceBaseUrl, appType);
+  const content = buildPackerPhp(token, sourceUser, sourcePath, appType);
   await uploadFileToCpanel(sourceUser, relDir, fileName, content);
 
   const base = sourceBaseUrl.replace(/\/$/, "");
@@ -641,7 +643,6 @@ export async function callPackerPack(
   dbHost: string;
   tablePrefix: string;
   zipName: string;
-  zipUrl: string;
   zipSize: number;
 }> {
   const url = `${packerUrl}?token=${encodeURIComponent(packerToken)}&action=pack`;
@@ -663,7 +664,6 @@ export async function callPackerPack(
     dbHost: String(json.dbHost ?? "localhost"),
     tablePrefix: String(json.tablePrefix ?? "wp_"),
     zipName: String(json.zipName ?? ""),
-    zipUrl: String(json.zipUrl ?? ""),
     zipSize: Number(json.zipSize ?? 0),
   };
 }
@@ -675,7 +675,8 @@ export async function deployUnpackerAgent(params: {
   targetUser: string;
   destPath: string;
   appType: AppType;
-  zipUrl: string;
+  packerUrl: string;
+  packerToken: string;
   newDbName: string;
   newDbUser: string;
   newDbPass: string;
@@ -693,7 +694,8 @@ export async function deployUnpackerAgent(params: {
   // Upload agent directly into the destination directory
   const content = buildUnpackerPhp({
     token,
-    zipUrl: params.zipUrl,
+    packerUrl: params.packerUrl,
+    packerToken: params.packerToken,
     destPath: params.destPath,
     appType: params.appType,
     newDbName: params.newDbName,
@@ -816,7 +818,7 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
     await log(jobId, targetUser, "Compression des fichiers et export SQL (peut prendre 1-5 min)…");
     const packResult = await callPackerPack(packerUrl, packerToken, 10 * 60 * 1000);
     const zipMb = (packResult.zipSize / 1024 / 1024).toFixed(1);
-    await log(jobId, targetUser, `Archive créée — ${zipMb} Mo — URL: ${packResult.zipUrl}`);
+    await log(jobId, targetUser, `Archive créée — ${zipMb} Mo (${packResult.zipName})`);
 
     // 3. Deploy unpacker directly into destination directory
     await log(jobId, targetUser, "Déploiement de l'agent unpacker sur le compte cible…");
@@ -824,7 +826,8 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
       targetUser,
       destPath: target.destPath,
       appType,
-      zipUrl: packResult.zipUrl,
+      packerUrl,
+      packerToken,
       newDbName: target.newDbName,
       newDbUser: target.newDbUser,
       newDbPass: target.newDbPass,
