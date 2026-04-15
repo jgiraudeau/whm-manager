@@ -426,9 +426,19 @@ $curlError = curl_error($ch);
 $httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
 curl_close($ch);
 
-if ($curlError || $httpCode !== 200 || !file_exists($zipPath) || filesize($zipPath) < 100) {
+$downloadedSize = file_exists($zipPath) ? filesize($zipPath) : 0;
+if ($curlError || $httpCode !== 200 || $downloadedSize < 100) {
     @unlink($zipPath);
-    echo json_encode(['error' => 'Failed to download ZIP from packer (HTTP ' . $httpCode . '): ' . $curlError]);
+    echo json_encode(['error' => 'Failed to download ZIP from packer (HTTP ' . $httpCode . ', size=' . $downloadedSize . '): ' . $curlError]);
+    exit;
+}
+
+// Verify ZIP magic bytes (PK = 50 4B 03 04)
+$magic = file_get_contents($zipPath, false, null, 0, 4);
+if ($magic !== "PK\x03\x04") {
+    $preview = substr(file_get_contents($zipPath, false, null, 0, 500), 0, 500);
+    @unlink($zipPath);
+    echo json_encode(['error' => 'Downloaded file is not a valid ZIP (size=' . $downloadedSize . ', magic=' . bin2hex($magic) . '). Content preview: ' . $preview]);
     exit;
 }
 
