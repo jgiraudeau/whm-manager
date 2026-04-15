@@ -596,6 +596,7 @@ export interface DeployPackerResult {
 
 /**
  * Deploy the packer agent to the source account.
+ * The PHP file is placed directly in sourcePath (no subdirectory needed).
  * Returns the public URL to call the packer.
  */
 export async function deployPackerAgent(
@@ -605,23 +606,15 @@ export async function deployPackerAgent(
   appType: AppType,
 ): Promise<DeployPackerResult> {
   const token = randomToken(32);
-  const dirName = `.wp-migrator-${randomToken(6)}`;
-  const fileName = `agent.php`;
-  const agentPath = `${sourcePath}/${dirName}`;
+  const fileName = `whm_packer_${randomToken(8)}.php`;
+  const relDir = toHomeRelative(sourceUser, sourcePath);
 
-  // 1. Create directory
-  await createDirectoryCpanel(sourceUser, agentPath);
-
-  // 2. Upload .htaccess to force PHP execution
-  const htaccess = `<Files "*.php">\n  SetHandler application/x-httpd-php\n</Files>\n`;
-  await uploadFileToCpanel(sourceUser, agentPath, ".htaccess", htaccess);
-
-  // 3. Upload Agent
+  // Upload agent directly into the existing installation directory
   const content = buildPackerPhp(token, sourcePath, appType);
-  await uploadFileToCpanel(sourceUser, agentPath, fileName, content);
+  await uploadFileToCpanel(sourceUser, relDir, fileName, content);
 
   const base = sourceBaseUrl.replace(/\/$/, "");
-  const packerPublicUrl = `${base}/${dirName}/${fileName}`;
+  const packerPublicUrl = `${base}/${fileName}`;
 
   return { packerFileName: fileName, packerToken: token, packerPublicUrl };
 }
@@ -678,20 +671,16 @@ export async function deployUnpackerAgent(params: {
   newDbPass: string;
   newSiteUrl: string;
   oldSiteUrl: string;
-}): Promise<{ unpackerFileName: string; unpackerToken: string; unpackerDir: string }> {
+  unpackerBaseUrl: string;
+}): Promise<{ unpackerFileName: string; unpackerToken: string }> {
   const token = randomToken(32);
-  const dirName = `.wp-engine-${randomToken(6)}`;
-  const fileName = `agent.php`;
-  const agentPath = `${params.destPath}/${dirName}`;
+  const fileName = `whm_unpacker_${randomToken(8)}.php`;
 
-  // 1. Create directory
-  await createDirectoryCpanel(params.targetUser, agentPath);
+  // Ensure destination directory exists (subdomain dir may not be created yet)
+  const relDestDir = toHomeRelative(params.targetUser, params.destPath);
+  await createDirectoryCpanel(params.targetUser, params.destPath);
 
-  // 2. Upload .htaccess
-  const htaccess = `<Files "*.php">\n  SetHandler application/x-httpd-php\n</Files>\n`;
-  await uploadFileToCpanel(params.targetUser, agentPath, ".htaccess", htaccess);
-
-  // 3. Upload Agent
+  // Upload agent directly into the destination directory
   const content = buildUnpackerPhp({
     token,
     packerUrl: params.packerUrl,
@@ -705,9 +694,9 @@ export async function deployUnpackerAgent(params: {
     oldSiteUrl: params.oldSiteUrl,
   });
 
-  await uploadFileToCpanel(params.targetUser, agentPath, fileName, content);
+  await uploadFileToCpanel(params.targetUser, relDestDir, fileName, content);
 
-  return { unpackerFileName: fileName, unpackerToken: token, unpackerDir: dirName };
+  return { unpackerFileName: fileName, unpackerToken: token };
 }
 
 /**
@@ -794,9 +783,11 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
 
   let packerToken = "";
   let packerUrl = "";
-  let packerDir = "";
+  let packerFileName = "";
   let unpackerToken = "";
-  let unpackerDir = "";
+  let unpackerFileName = "";
+
+  const unpackerBaseUrl = (target.unpackerBaseUrl ?? target.newSiteUrl).replace(/\/$/, "");
 
   try {
     await updateMigrationTarget(jobId, targetUser, {
@@ -804,21 +795,21 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
       startedAt: new Date().toISOString(),
     });
 
-    // 1. Deploy packer
+    // 1. Deploy packer directly into source installation directory
     await log(jobId, targetUser, "Déploiement de l'agent packer sur le compte source…");
     const packer = await deployPackerAgent(sourceUser, sourcePath, sourceUrl, appType);
-    packerDir = packer.packerPublicUrl.split("/").slice(-2, -1)[0];
+    packerFileName = packer.packerFileName;
     packerToken = packer.packerToken;
     packerUrl = packer.packerPublicUrl;
-    await log(jobId, targetUser, `Agent packer déployé dans le dossier ${packerDir}`);
+    await log(jobId, targetUser, `Agent packer déployé : ${packerFileName}`);
 
-    // 2. Call packer to create ZIP
+    // 2. Call packer to create ZIP + SQL dump
     await log(jobId, targetUser, "Compression des fichiers et export SQL (peut prendre 1-5 min)…");
     const packResult = await callPackerPack(packerUrl, packerToken, 10 * 60 * 1000);
     const zipMb = (packResult.zipSize / 1024 / 1024).toFixed(1);
     await log(jobId, targetUser, `Archive créée — ${zipMb} Mo — DB: ${packResult.dbName}`);
 
-    // 3. Deploy unpacker
+    // 3. Deploy unpacker directly into destination directory
     await log(jobId, targetUser, "Déploiement de l'agent unpacker sur le compte cible…");
     const unpacker = await deployUnpackerAgent({
       targetUser,
@@ -831,16 +822,15 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
       newDbPass: target.newDbPass,
       newSiteUrl: target.newSiteUrl,
       oldSiteUrl: sourceUrl,
+      unpackerBaseUrl,
     });
-    unpackerDir = unpacker.unpackerDir;
+    unpackerFileName = unpacker.unpackerFileName;
     unpackerToken = unpacker.unpackerToken;
-    await log(jobId, targetUser, `Agent unpacker déployé dans le dossier ${unpackerDir}`);
+    await log(jobId, targetUser, `Agent unpacker déployé : ${unpackerFileName}`);
 
-    // 4. Call unpacker (P2P transfer + restore)
+    // 4. Call unpacker — P2P download + extract + import SQL + patch config
     await log(jobId, targetUser, "Transfert P2P + extraction + import SQL + patch config…");
-    // Prefer unpackerBaseUrl (via main domain, DNS-instant) over newSiteUrl (subdomain, may lag)
-    const unpackerBase = (target.unpackerBaseUrl ?? target.newSiteUrl).replace(/\/$/, "");
-    const unpackerPublicUrl = `${unpackerBase}/${unpackerDir}/agent.php`;
+    const unpackerPublicUrl = `${unpackerBaseUrl}/${unpackerFileName}`;
     const { targetUrl } = await callUnpackerUnpack(unpackerPublicUrl, unpackerToken, 20 * 60 * 1000);
     await log(jobId, targetUser, `✅ Migration terminée → ${targetUrl}`);
 
@@ -858,19 +848,20 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
       finishedAt: new Date().toISOString(),
     });
   } finally {
-    // Always try to cleanup agents
-    if (packerDir || unpackerDir) {
+    // Best-effort cleanup of agent files
+    if (packerFileName || unpackerFileName) {
       try {
-        await cleanupAgents({
-          sourceUser,
-          sourcePath,
-          packerDir,
-          packerUrl,
-          packerToken,
-          targetUser,
-          destPath: target.destPath,
-          unpackerDir,
-        });
+        await Promise.allSettled([
+          packerFileName
+            ? fetch(`${packerUrl}?token=${packerToken}&action=cleanup`).catch(() => null)
+            : Promise.resolve(),
+          packerFileName
+            ? deleteFromCpanel(sourceUser, `${sourcePath}/${packerFileName}`, "file")
+            : Promise.resolve(),
+          unpackerFileName
+            ? deleteFromCpanel(targetUser, `${target.destPath}/${unpackerFileName}`, "file")
+            : Promise.resolve(),
+        ]);
       } catch {
         // best-effort
       }
