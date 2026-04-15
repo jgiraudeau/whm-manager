@@ -54,9 +54,10 @@ async function uploadFileToCpanel(
   fileName: string,
   content: string,
 ): Promise<void> {
-  // Send raw content — some cPanel versions store base64 literally instead of decoding it
+  // cPanel Fileman expects home-relative paths (e.g. public_html/foo), not absolute paths
+  const relDir = toHomeRelative(user, destDir);
   const result = await cpanelApi(user, "Fileman", "save_file_content", {
-    dir: destDir,
+    dir: relDir,
     file: fileName,
     content,
   });
@@ -89,11 +90,26 @@ function splitPath(fullPath: string) {
 }
 
 /**
+ * Convert an absolute path to a cPanel home-relative path.
+ * cPanel Fileman expects paths relative to the account home dir, not absolute.
+ * e.g. /home/user/public_html/foo  →  public_html/foo
+ */
+function toHomeRelative(user: string, absolutePath: string): string {
+  const prefix = `/home/${user}/`;
+  if (absolutePath.startsWith(prefix)) {
+    return absolutePath.slice(prefix.length);
+  }
+  // Already relative or unexpected format — return as-is
+  return absolutePath.replace(/^\//, "");
+}
+
+/**
  * Create a directory on a cPanel account via UAPI Fileman.
  */
 async function createDirectoryCpanel(user: string, path: string): Promise<void> {
   try {
-    const { dir, name } = splitPath(path);
+    const relPath = toHomeRelative(user, path);
+    const { dir, name } = splitPath(relPath);
     await cpanelApi(user, "Fileman", "mkdir", {
       path: dir,
       name: name,
@@ -108,12 +124,13 @@ async function createDirectoryCpanel(user: string, path: string): Promise<void> 
  */
 async function deleteFromCpanel(user: string, fullPath: string, type: "file" | "dir" = "file"): Promise<void> {
   try {
-    const { dir, name } = splitPath(fullPath);
+    const relPath = toHomeRelative(user, fullPath);
+    const { dir, name } = splitPath(relPath);
     await cpanelApi(user, "Fileman", "delete_files", {
       "files-0-dir": dir,
       "files-0-file": name,
       "files-0-type": type,
-      "files-0-path": fullPath.replace(/\/+$/, ""),
+      "files-0-path": relPath,
     });
   } catch {
     // best-effort
