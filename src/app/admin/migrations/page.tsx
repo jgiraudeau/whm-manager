@@ -17,6 +17,7 @@ import {
   Server,
   ExternalLink,
   AlertTriangle,
+  Stethoscope,
 } from "lucide-react";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -113,6 +114,12 @@ export default function MigrationsPage() {
   // Past jobs
   const [pastJobs, setPastJobs] = useState<MigrationJob[]>([]);
   const [expandedLogs, setExpandedLogs] = useState<Set<string>>(new Set());
+
+  // Diagnostic state
+  const [diagUser, setDiagUser] = useState("");
+  const [diagRunning, setDiagRunning] = useState(false);
+  const [diagResult, setDiagResult] = useState<Record<string, unknown> | null>(null);
+  const [diagError, setDiagError] = useState<string | null>(null);
 
   // Load accounts on mount
   useEffect(() => {
@@ -271,6 +278,27 @@ export default function MigrationsPage() {
   const isJobRunning = (job: MigrationJob) =>
     job.targets.some((t) => t.status === "running" || t.status === "pending");
 
+  async function runDiag() {
+    if (!diagUser) return;
+    setDiagRunning(true);
+    setDiagResult(null);
+    setDiagError(null);
+    try {
+      const res = await fetch("/api/accounts/diagnose", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user: diagUser }),
+      });
+      const data = await res.json() as { success?: boolean; probe?: Record<string, unknown>; error?: string; tip?: string };
+      if (data.probe) setDiagResult(data.probe);
+      else setDiagError(data.error ?? data.tip ?? "Erreur inconnue");
+    } catch (e) {
+      setDiagError(e instanceof Error ? e.message : "Erreur réseau");
+    } finally {
+      setDiagRunning(false);
+    }
+  }
+
   // ─── Render steps ────────────────────────────────────────────────────────────
 
   return (
@@ -284,6 +312,78 @@ export default function MigrationsPage() {
         <p className="text-gray-500 text-sm mt-1">
           Clonez WordPress ou PrestaShop d&apos;un compte source vers N comptes cibles (P2P)
         </p>
+      </div>
+
+      {/* ── Diagnostic panel ──────────────────────────────────────────────────── */}
+      <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
+        <div className="flex items-center gap-2">
+          <Stethoscope className="w-4 h-4 text-amber-400" />
+          <h3 className="text-sm font-bold text-white">Diagnostic PHP — capacités du serveur</h3>
+        </div>
+        <p className="text-xs text-gray-500">
+          Déploie une sonde temporaire sur un compte pour vérifier si exec, ZipArchive, mysqldump, PDO et cURL sont disponibles.
+        </p>
+        <div className="flex items-center gap-3">
+          <select
+            value={diagUser}
+            onChange={(e) => setDiagUser(e.target.value)}
+            className="bg-gray-800 border border-gray-700 text-white px-3 py-2 rounded-lg text-sm focus:outline-none focus:border-amber-500 flex-1 max-w-xs"
+          >
+            <option value="">— Choisir un compte —</option>
+            {accounts.map((a) => (
+              <option key={a.user} value={a.user}>{a.user} ({a.domain})</option>
+            ))}
+          </select>
+          <button
+            onClick={runDiag}
+            disabled={!diagUser || diagRunning}
+            className="flex items-center gap-2 px-4 py-2 bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white rounded-lg text-sm font-bold transition-all"
+          >
+            {diagRunning ? <><Loader2 className="w-4 h-4 animate-spin" /> Test…</> : <><Stethoscope className="w-4 h-4" /> Tester</>}
+          </button>
+        </div>
+
+        {diagError && (
+          <div className="flex items-start gap-2 p-3 bg-red-900/20 border border-red-800/40 rounded-lg text-red-400 text-xs">
+            <XCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+            <span>{diagError}</span>
+          </div>
+        )}
+
+        {diagResult && (
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs font-mono">
+            {[
+              { key: "php_version", label: "PHP" },
+              { key: "exec_disabled", label: "exec() bloqué", invert: true },
+              { key: "exec_test", label: "exec() test" },
+              { key: "mysqldump", label: "mysqldump" },
+              { key: "mysql_cli", label: "mysql cli" },
+              { key: "zip_archive", label: "ZipArchive" },
+              { key: "pdo_mysql", label: "PDO MySQL" },
+              { key: "curl", label: "cURL" },
+              { key: "curl_ssl", label: "cURL HTTPS" },
+              { key: "tmp_writable", label: "/tmp writable" },
+              { key: "memory_limit", label: "mémoire" },
+              { key: "max_execution_time", label: "max exec time" },
+            ].map(({ key, label, invert }) => {
+              const val = diagResult[key];
+              const isBool = typeof val === "boolean";
+              const isOk = isBool ? (invert ? !val : val) : (val !== null && val !== "not_found" && val !== "failed");
+              const display = isBool ? (val ? "oui" : "non") : (val === null ? "N/A" : String(val));
+              return (
+                <div key={key} className={`flex items-center gap-2 px-3 py-2 rounded-lg border ${isOk ? "border-emerald-800/40 bg-emerald-900/10" : "border-red-800/40 bg-red-900/10"}`}>
+                  {isOk
+                    ? <CheckCircle className="w-3.5 h-3.5 text-emerald-400 flex-shrink-0" />
+                    : <XCircle className="w-3.5 h-3.5 text-red-400 flex-shrink-0" />}
+                  <div className="min-w-0">
+                    <p className="text-gray-500 text-[10px] uppercase tracking-wider">{label}</p>
+                    <p className={`truncate ${isOk ? "text-emerald-300" : "text-red-300"}`}>{display}</p>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Step indicator */}
