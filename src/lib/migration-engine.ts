@@ -164,7 +164,8 @@ define('AGENT_TOKEN', '${escapedToken}');
 define('SOURCE_PATH', '${escapedPath}');
 define('APP_TYPE', '${appLabel}');
 define('ZIP_NAME', 'whm_pack_' . substr(md5(SOURCE_PATH . AGENT_TOKEN), 0, 8) . '.zip');
-define('ZIP_PATH', sys_get_temp_dir() . DIRECTORY_SEPARATOR . ZIP_NAME);
+// Store ZIP in SOURCE_PATH (web root) — sys_get_temp_dir() is CageFS-isolated per request
+define('ZIP_PATH', SOURCE_PATH . DIRECTORY_SEPARATOR . ZIP_NAME);
 
 header('Content-Type: application/json');
 
@@ -260,8 +261,8 @@ if ($action === 'pack') {
         exit;
     }
 
-    // Export SQL dump using mysqldump
-    $sqlPath = sys_get_temp_dir() . '/whm_dump_' . md5(AGENT_TOKEN) . '.sql';
+    // Export SQL dump — use SOURCE_PATH (persistent) not /tmp (CageFS-isolated per request)
+    $sqlPath = SOURCE_PATH . '/whm_dump_' . md5(AGENT_TOKEN) . '.sql';
     $dumpCmd = sprintf(
         'mysqldump --single-transaction --quick -h %s -u %s %s %s > %s 2>&1',
         escapeshellarg($dbHost),
@@ -409,7 +410,8 @@ if ($action !== 'unpack') {
 }
 
 // ── Step 1: Download ZIP from packer (P2P)
-$zipPath = sys_get_temp_dir() . '/whm_unpack_' . md5(AGENT_TOKEN) . '.zip';
+// Store in DEST_PATH (persistent web dir) not /tmp (CageFS-isolated per request)
+$zipPath = DEST_PATH . '/whm_unpack_' . md5(AGENT_TOKEN) . '.zip';
 $ch = curl_init(PACKER_URL . '?action=download&token=' . PACKER_TOKEN);
 curl_setopt_array($ch, [
     CURLOPT_RETURNTRANSFER => false,
