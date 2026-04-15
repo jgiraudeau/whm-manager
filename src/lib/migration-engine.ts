@@ -141,33 +141,149 @@ async function deleteFromCpanel(user: string, fullPath: string, type: "file" | "
 
 /**
  * Generates the PHP "packer" agent.
- * When called with ?token=TOKEN&action=pack, it:
- *  1. Finds the WordPress/PrestaShop root (sourcePath)
- *  2. Creates a ZIP of the entire installation
- *  3. Exports the database to a SQL file inside the ZIP
- *  4. Returns a JSON with { zipUrl, zipToken } — a signed URL to download the ZIP
  *
- * When called with ?token=TOKEN&action=cleanup, it deletes the ZIP + itself.
+ * Architecture: background CLI process to bypass PHP-FPM request_terminate_timeout.
+ *
+ * Web actions:
+ *   ?action=pack    → launch background PHP CLI process, return immediately {"started":true}
+ *   ?action=status  → read status file, return current state (starting|running|done|error)
+ *   ?action=download → serve ZIP from home dir
+ *   ?action=cleanup  → delete ZIP + status file + self
+ *
+ * CLI mode (invoked by exec nohup): does the actual mysqldump + ZipArchive work,
+ * writes progress to STATUS_FILE, writes final result when done.
  */
 function buildPackerPhp(token: string, sourceUser: string, sourcePath: string, appType: AppType): string {
-  const escapedPath = sourcePath.replace(/'/g, "\\'");
-  const escapedToken = token.replace(/'/g, "\\'");
-  const escapedUser = sourceUser.replace(/'/g, "\\'");
+  const e = (s: string) => s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+  const escapedToken = e(token);
+  const escapedUser = e(sourceUser);
+  const escapedPath = e(sourcePath);
   const appLabel = appType === "wordpress" ? "wordpress" : "prestashop";
 
   return `<?php
-// WHM Manager — Packer Agent (auto-generated, auto-deletes after use)
+// WHM Manager — Packer Agent (auto-generated)
 error_reporting(0);
-set_time_limit(0);
-ini_set('memory_limit', '512M');
 
 define('AGENT_TOKEN', '${escapedToken}');
 define('SOURCE_PATH', '${escapedPath}');
-define('APP_TYPE', '${appLabel}');
-define('ZIP_NAME', 'whm_pack_' . substr(md5(SOURCE_PATH . AGENT_TOKEN), 0, 8) . '.zip');
-// Store ZIP in home dir (outside SOURCE_PATH) to avoid ZipArchive self-reference loop
-define('ZIP_PATH', '/home/${escapedUser}/' . ZIP_NAME);
+define('APP_TYPE',    '${appLabel}');
+define('ZIP_NAME',    'whm_pack_' . substr(md5(SOURCE_PATH . AGENT_TOKEN), 0, 8) . '.zip');
+define('HOME_DIR',    '/home/${escapedUser}/');
+define('ZIP_PATH',    HOME_DIR . ZIP_NAME);
+define('SQL_PATH',    HOME_DIR . 'whm_dump_' . substr(md5(AGENT_TOKEN), 0, 8) . '.sql');
+define('STATUS_FILE', HOME_DIR . 'whm_status_' . substr(md5(AGENT_TOKEN), 0, 8) . '.json');
 
+// ════════════════════════════════════════════════════════════
+// CLI background mode — runs via: nohup php -f packer.php
+// ════════════════════════════════════════════════════════════
+if (php_sapi_name() === 'cli') {
+    set_time_limit(0);
+    ini_set('memory_limit', '512M');
+
+    function ws($data) { file_put_contents(STATUS_FILE, json_encode($data)); }
+
+    ws(['status' => 'running', 'step' => 'reading_config', 'ts' => time()]);
+
+    $dbHost = 'localhost'; $dbName = ''; $dbUser = ''; $dbPass = ''; $tablePrefix = 'wp_';
+
+    if (APP_TYPE === 'wordpress') {
+        $cf = SOURCE_PATH . '/wp-config.php';
+        if (file_exists($cf)) {
+            $c = file_get_contents($cf);
+            if (preg_match("/define\\s*\\(\\s*'DB_NAME'\\s*,\\s*'([^']+)'/",     $c, $m)) $dbName      = $m[1];
+            if (preg_match("/define\\s*\\(\\s*'DB_USER'\\s*,\\s*'([^']+)'/",     $c, $m)) $dbUser      = $m[1];
+            if (preg_match("/define\\s*\\(\\s*'DB_PASSWORD'\\s*,\\s*'([^']+)'/", $c, $m)) $dbPass      = $m[1];
+            if (preg_match("/define\\s*\\(\\s*'DB_HOST'\\s*,\\s*'([^']+)'/",     $c, $m)) $dbHost      = $m[1];
+            if (preg_match("/\\\\$table_prefix\\s*=\\s*'([^']+)'/",              $c, $m)) $tablePrefix = $m[1];
+        }
+    } elseif (APP_TYPE === 'prestashop') {
+        foreach ([SOURCE_PATH . '/app/config/parameters.php', SOURCE_PATH . '/config/settings.inc.php'] as $pf) {
+            if (!file_exists($pf)) continue;
+            $c = file_get_contents($pf);
+            if (preg_match("/'database_host'\\s*=>\\s*'([^']+)'/",     $c, $m)) $dbHost = $m[1];
+            if (preg_match("/'database_name'\\s*=>\\s*'([^']+)'/",     $c, $m)) $dbName = $m[1];
+            if (preg_match("/'database_user'\\s*=>\\s*'([^']+)'/",     $c, $m)) $dbUser = $m[1];
+            if (preg_match("/'database_password'\\s*=>\\s*'([^']+)'/", $c, $m)) $dbPass = $m[1];
+            if (!$dbName) {
+                if (preg_match("/_DB_NAME_\\s*,\\s*'([^']+)'/",   $c, $m)) $dbName = $m[1];
+                if (preg_match("/_DB_USER_\\s*,\\s*'([^']+)'/",   $c, $m)) $dbUser = $m[1];
+                if (preg_match("/_DB_PASSWD_\\s*,\\s*'([^']+)'/", $c, $m)) $dbPass = $m[1];
+            }
+            if ($dbName) break;
+        }
+    }
+
+    if (!$dbName || !$dbUser) {
+        ws(['status' => 'error', 'error' => 'Cannot read DB credentials from config', 'ts' => time()]);
+        exit(1);
+    }
+
+    // ── mysqldump
+    ws(['status' => 'running', 'step' => 'dumping_db', 'ts' => time()]);
+    @unlink(SQL_PATH);
+    $dumpCmd = sprintf('mysqldump --single-transaction --quick -h %s -u %s -p%s %s > %s 2>&1',
+        escapeshellarg($dbHost), escapeshellarg($dbUser), escapeshellarg($dbPass),
+        escapeshellarg($dbName), escapeshellarg(SQL_PATH));
+    exec($dumpCmd, $dOut, $dCode);
+    if ($dCode !== 0 || !file_exists(SQL_PATH) || filesize(SQL_PATH) < 10) {
+        @unlink(SQL_PATH);
+        ws(['status' => 'error', 'error' => 'mysqldump failed (code ' . $dCode . ')', 'ts' => time()]);
+        exit(1);
+    }
+
+    // ── ZipArchive (no compression = CM_STORE, saves CPU)
+    ws(['status' => 'running', 'step' => 'creating_zip', 'ts' => time()]);
+    @unlink(ZIP_PATH);
+    $zip = new ZipArchive();
+    if ($zip->open(ZIP_PATH, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+        @unlink(SQL_PATH);
+        ws(['status' => 'error', 'error' => 'Cannot create ZIP file', 'ts' => time()]);
+        exit(1);
+    }
+
+    $zip->addFile(SQL_PATH, '_whm_export.sql');
+    $zip->setCompressionIndex(0, 0); // CM_STORE for SQL dump
+
+    $EXCL = ['wp-content/cache', 'wp-content/upgrade', 'var/cache', 'cache', 'var/logs', 'var/sessions'];
+    $iter = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator(SOURCE_PATH, RecursiveDirectoryIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::LEAVES_ONLY
+    );
+    foreach ($iter as $file) {
+        if ($file->isDir()) continue;
+        $fp  = $file->getRealPath();
+        if (!$fp || $fp === ZIP_PATH || $fp === SQL_PATH || $fp === STATUS_FILE) continue;
+        $rel = ltrim(substr($fp, strlen(SOURCE_PATH)), DIRECTORY_SEPARATOR);
+        foreach ($EXCL as $x) { if (strpos($rel, $x) === 0) continue 2; }
+        $zip->addFile($fp, $rel);
+        $zip->setCompressionIndex($zip->numFiles - 1, 0); // CM_STORE — no CPU compression
+    }
+
+    $zip->close();
+    @unlink(SQL_PATH);
+
+    $zipSize = file_exists(ZIP_PATH) ? filesize(ZIP_PATH) : 0;
+    if ($zipSize < 100) {
+        ws(['status' => 'error', 'error' => 'ZIP too small (' . $zipSize . ' bytes)', 'ts' => time()]);
+        exit(1);
+    }
+
+    ws([
+        'status'      => 'done',
+        'zipName'     => ZIP_NAME,
+        'zipSize'     => $zipSize,
+        'dbName'      => $dbName,
+        'dbHost'      => $dbHost,
+        'tablePrefix' => $tablePrefix,
+        'ts'          => time(),
+    ]);
+    exit(0);
+}
+
+// ════════════════════════════════════════════════════════════
+// WEB mode — short-lived HTTP requests only
+// ════════════════════════════════════════════════════════════
+set_time_limit(60);
 header('Content-Type: application/json');
 
 if (!isset($_GET['token']) || $_GET['token'] !== AGENT_TOKEN) {
@@ -178,25 +294,37 @@ if (!isset($_GET['token']) || $_GET['token'] !== AGENT_TOKEN) {
 
 $action = $_GET['action'] ?? 'pack';
 
-// ── Cleanup action
-if ($action === 'cleanup') {
-    @unlink(ZIP_PATH);
-    @unlink(__FILE__);
-    echo json_encode(['success' => true, 'action' => 'cleanup']);
+// ── Launch background pack process
+if ($action === 'pack') {
+    $existing = file_exists(STATUS_FILE) ? @json_decode(file_get_contents(STATUS_FILE), true) : null;
+    if ($existing && in_array($existing['status'] ?? '', ['running', 'done', 'error'], true)) {
+        echo json_encode(['started' => true, 'status' => $existing['status'] ?? 'unknown']);
+        exit;
+    }
+    file_put_contents(STATUS_FILE, json_encode(['status' => 'starting', 'ts' => time()]));
+
+    // Find PHP binary
+    $phpBin = PHP_BINARY;
+    if (!$phpBin || !is_executable($phpBin)) {
+        foreach (['/usr/local/bin/php', '/usr/bin/php'] as $p) {
+            if (is_executable($p)) { $phpBin = $p; break; }
+        }
+    }
+    exec('nohup ' . escapeshellarg($phpBin) . ' -f ' . escapeshellarg(__FILE__) . ' > /dev/null 2>&1 &');
+    echo json_encode(['started' => true, 'status' => 'starting']);
     exit;
 }
 
-// ── Status action (check if ZIP exists + size)
+// ── Poll status
 if ($action === 'status') {
-    $exists = file_exists(ZIP_PATH);
-    echo json_encode([
-        'ready' => $exists,
-        'size'  => $exists ? filesize(ZIP_PATH) : 0,
-    ]);
+    $data = file_exists(STATUS_FILE)
+        ? (@json_decode(file_get_contents(STATUS_FILE), true) ?? ['status' => 'unknown'])
+        : ['status' => 'not_started'];
+    echo json_encode($data);
     exit;
 }
 
-// ── Download action (serve the ZIP)
+// ── Download ZIP
 if ($action === 'download') {
     if (!file_exists(ZIP_PATH)) {
         http_response_code(404);
@@ -211,134 +339,12 @@ if ($action === 'download') {
     exit;
 }
 
-// ── Pack action: create ZIP + SQL dump
-if ($action === 'pack') {
-    if (!is_dir(SOURCE_PATH)) {
-        http_response_code(400);
-        echo json_encode(['error' => 'Source path does not exist: ' . SOURCE_PATH]);
-        exit;
-    }
-
-    // Read DB credentials from wp-config.php or PrestaShop parameters
-    $dbHost = 'localhost';
-    $dbName = '';
-    $dbUser = '';
-    $dbPass = '';
-    $tablePrefix = 'wp_';
-
-    if (APP_TYPE === 'wordpress') {
-        $configFile = SOURCE_PATH . '/wp-config.php';
-        if (file_exists($configFile)) {
-            $configContent = file_get_contents($configFile);
-            if (preg_match("/define\\s*\\(\\s*'DB_NAME'\\s*,\\s*'([^']+)'/", $configContent, $m)) $dbName = $m[1];
-            if (preg_match("/define\\s*\\(\\s*'DB_USER'\\s*,\\s*'([^']+)'/", $configContent, $m)) $dbUser = $m[1];
-            if (preg_match("/define\\s*\\(\\s*'DB_PASSWORD'\\s*,\\s*'([^']+)'/", $configContent, $m)) $dbPass = $m[1];
-            if (preg_match("/define\\s*\\(\\s*'DB_HOST'\\s*,\\s*'([^']+)'/", $configContent, $m)) $dbHost = $m[1];
-            if (preg_match("/\\\\$table_prefix\\s*=\\s*'([^']+)'/", $configContent, $m)) $tablePrefix = $m[1];
-        }
-    } elseif (APP_TYPE === 'prestashop') {
-        $paramFiles = [
-            SOURCE_PATH . '/app/config/parameters.php',
-            SOURCE_PATH . '/config/settings.inc.php',
-        ];
-        foreach ($paramFiles as $pf) {
-            if (!file_exists($pf)) continue;
-            $c = file_get_contents($pf);
-            if (preg_match("/'database_host'\\s*=>\\s*'([^']+)'/", $c, $m)) $dbHost = $m[1];
-            if (preg_match("/'database_name'\\s*=>\\s*'([^']+)'/", $c, $m)) $dbName = $m[1];
-            if (preg_match("/'database_user'\\s*=>\\s*'([^']+)'/", $c, $m)) $dbUser = $m[1];
-            if (preg_match("/'database_password'\\s*=>\\s*'([^']+)'/", $c, $m)) $dbPass = $m[1];
-            if (empty($dbName)) {
-                if (preg_match("/_DB_NAME_\\s*,\\s*'([^']+)'/", $c, $m)) $dbName = $m[1];
-                if (preg_match("/_DB_USER_\\s*,\\s*'([^']+)'/", $c, $m)) $dbUser = $m[1];
-                if (preg_match("/_DB_PASSWD_\\s*,\\s*'([^']+)'/", $c, $m)) $dbPass = $m[1];
-            }
-            if ($dbName) break;
-        }
-    }
-
-    if (!$dbName || !$dbUser) {
-        echo json_encode(['error' => 'Could not read DB credentials from config file']);
-        exit;
-    }
-
-    $sqlPath = sys_get_temp_dir() . '/whm_dump_' . md5(AGENT_TOKEN) . '.sql';
-    $dumpCmd = sprintf(
-        'mysqldump --single-transaction --quick -h %s -u %s %s %s > %s 2>&1',
-        escapeshellarg($dbHost),
-        escapeshellarg($dbUser),
-        '-p' . escapeshellarg($dbPass),
-        escapeshellarg($dbName),
-        escapeshellarg($sqlPath)
-    );
-    exec($dumpCmd, $dumpOut, $dumpCode);
-    if ($dumpCode !== 0 || !file_exists($sqlPath) || filesize($sqlPath) < 10) {
-        @unlink($sqlPath);
-        echo json_encode(['error' => 'mysqldump failed (code ' . $dumpCode . '). Check DB credentials.']);
-        exit;
-    }
-
-    // Create ZIP with ZipArchive
-    if (!class_exists('ZipArchive')) {
-        echo json_encode(['error' => 'ZipArchive not available on this server']);
-        exit;
-    }
-
+// ── Cleanup
+if ($action === 'cleanup') {
     @unlink(ZIP_PATH);
-    $zip = new ZipArchive();
-    if ($zip->open(ZIP_PATH, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
-        echo json_encode(['error' => 'Cannot create ZIP file']);
-        exit;
-    }
-
-    // Add SQL dump as _whm_export.sql inside the archive
-    $zip->addFile($sqlPath, '_whm_export.sql');
-
-    // Add all files from SOURCE_PATH (exclude cache dirs for speed)
-    $EXCLUDE_DIRS = ['wp-content/cache', 'wp-content/upgrade', 'var/cache', 'cache', 'var/logs', 'var/sessions'];
-    $iterator = new RecursiveIteratorIterator(
-        new RecursiveDirectoryIterator(SOURCE_PATH, RecursiveDirectoryIterator::SKIP_DOTS),
-        RecursiveIteratorIterator::LEAVES_ONLY
-    );
-    foreach ($iterator as $file) {
-        if ($file->isDir()) continue;
-        $filePath = $file->getRealPath();
-        $relativePath = ltrim(substr($filePath, strlen(SOURCE_PATH)), DIRECTORY_SEPARATOR);
-        foreach ($EXCLUDE_DIRS as $excl) {
-            if (strpos($relativePath, $excl) === 0) continue 2;
-        }
-        $zip->addFile($filePath, $relativePath);
-    }
-
-    $zip->close();
-    @unlink($sqlPath);
-
-    $zipSize = file_exists(ZIP_PATH) ? filesize(ZIP_PATH) : 0;
-    if ($zipSize < 100) {
-        echo json_encode(['error' => 'ZIP file is empty or too small']);
-        exit;
-    }
-
-    // Store runtime metadata for the unpacker
-    $meta = [
-        'dbName'      => $dbName,
-        'dbUser'      => $dbUser,
-        'dbPass'      => $dbPass,
-        'dbHost'      => $dbHost,
-        'tablePrefix' => $tablePrefix,
-        'zipName'     => ZIP_NAME,
-        'zipSize'     => $zipSize,
-    ];
-    file_put_contents(ZIP_PATH . '.meta.json', json_encode($meta));
-
-    echo json_encode([
-        'success'    => true,
-        'zipName'    => ZIP_NAME,
-        'zipSize'    => $zipSize,
-        'dbName'     => $dbName,
-        'dbHost'     => $dbHost,
-        'tablePrefix'=> $tablePrefix,
-    ]);
+    @unlink(STATUS_FILE);
+    @unlink(__FILE__);
+    echo json_encode(['success' => true, 'action' => 'cleanup']);
     exit;
 }
 
@@ -631,13 +637,14 @@ export async function deployPackerAgent(
 }
 
 /**
- * Call the packer to create the ZIP + SQL dump.
- * Returns pack metadata (DB name, size, etc.)
+ * Launch the packer background process, then poll until done.
+ * The packer ?action=pack starts a nohup CLI PHP process and returns immediately.
+ * We then poll ?action=status every 10 seconds until status=done or status=error.
  */
 export async function callPackerPack(
   packerUrl: string,
   packerToken: string,
-  timeoutMs = 10 * 60 * 1000,
+  timeoutMs = 15 * 60 * 1000,
 ): Promise<{
   dbName: string;
   dbHost: string;
@@ -645,27 +652,55 @@ export async function callPackerPack(
   zipName: string;
   zipSize: number;
 }> {
-  const url = `${packerUrl}?token=${encodeURIComponent(packerToken)}&action=pack`;
-  const res = await fetchWithTimeout(url, {}, timeoutMs);
-  const text = await res.text();
-
-  let json: Record<string, unknown>;
+  // 1. Launch background process (returns immediately)
+  const startUrl = `${packerUrl}?token=${encodeURIComponent(packerToken)}&action=pack`;
+  const startRes = await fetchWithTimeout(startUrl, {}, 30_000);
+  const startText = await startRes.text();
+  let startJson: Record<string, unknown>;
   try {
-    json = JSON.parse(text) as Record<string, unknown>;
+    startJson = JSON.parse(startText) as Record<string, unknown>;
   } catch {
-    throw new Error(`Packer returned non-JSON (HTTP ${res.status}) URL=${packerUrl} — ${text.slice(0, 300)}`);
+    throw new Error(`Packer start returned non-JSON (HTTP ${startRes.status}) — ${startText.slice(0, 300)}`);
   }
+  if (startJson.error) throw new Error(`Packer start error: ${startJson.error}`);
 
-  if (json.error) throw new Error(`Packer error: ${json.error}`);
-  if (!json.success) throw new Error(`Packer failed: ${JSON.stringify(json)}`);
+  // 2. Poll status every 10s
+  const deadline = Date.now() + timeoutMs;
+  let lastStep = "";
+  while (Date.now() < deadline) {
+    await sleep(10_000);
+    const statusUrl = `${packerUrl}?token=${encodeURIComponent(packerToken)}&action=status`;
+    let statusJson: Record<string, unknown>;
+    try {
+      const statusRes = await fetchWithTimeout(statusUrl, {}, 30_000);
+      const statusText = await statusRes.text();
+      statusJson = JSON.parse(statusText) as Record<string, unknown>;
+    } catch {
+      continue; // status file may not exist yet — keep polling
+    }
 
-  return {
-    dbName: String(json.dbName ?? ""),
-    dbHost: String(json.dbHost ?? "localhost"),
-    tablePrefix: String(json.tablePrefix ?? "wp_"),
-    zipName: String(json.zipName ?? ""),
-    zipSize: Number(json.zipSize ?? 0),
-  };
+    const status = String(statusJson.status ?? "");
+    const step = String(statusJson.step ?? "");
+    if (step && step !== lastStep) {
+      lastStep = step;
+      console.log(`[packer] status=${status} step=${step}`);
+    }
+
+    if (status === "done") {
+      return {
+        dbName: String(statusJson.dbName ?? ""),
+        dbHost: String(statusJson.dbHost ?? "localhost"),
+        tablePrefix: String(statusJson.tablePrefix ?? "wp_"),
+        zipName: String(statusJson.zipName ?? ""),
+        zipSize: Number(statusJson.zipSize ?? 0),
+      };
+    }
+    if (status === "error") {
+      throw new Error(`Packer background error: ${statusJson.error ?? "unknown"}`);
+    }
+    // starting / running — keep polling
+  }
+  throw new Error(`Packer timed out after ${Math.round(timeoutMs / 60000)} min`);
 }
 
 /**
@@ -814,9 +849,9 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
     packerUrl = packer.packerPublicUrl;
     await log(jobId, targetUser, `Agent packer déployé : ${packerFileName} → ${packerUrl}`);
 
-    // 2. Call packer to create ZIP + SQL dump
-    await log(jobId, targetUser, "Compression des fichiers et export SQL (peut prendre 1-5 min)…");
-    const packResult = await callPackerPack(packerUrl, packerToken, 10 * 60 * 1000);
+    // 2. Call packer to create ZIP + SQL dump (background process + polling)
+    await log(jobId, targetUser, "Lancement compression arrière-plan (poll toutes les 10s, ~1-10 min)…");
+    const packResult = await callPackerPack(packerUrl, packerToken, 15 * 60 * 1000);
     const zipMb = (packResult.zipSize / 1024 / 1024).toFixed(1);
     await log(jobId, targetUser, `Archive créée — ${zipMb} Mo (${packResult.zipName})`);
 
