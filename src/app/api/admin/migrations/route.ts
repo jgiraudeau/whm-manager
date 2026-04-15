@@ -80,6 +80,7 @@ export async function POST(req: NextRequest) {
       newDbUser: string;
       newDbPass: string;
       newSiteUrl: string;
+      unpackerBaseUrl: string; // URL via domaine principal (pas le sous-domaine, instantané)
     }> = [];
 
     for (const t of targets) {
@@ -99,6 +100,10 @@ export async function POST(req: NextRequest) {
       const newDbUser = `${t.user}_${dbSuffix}`;
       const newDbPass = generatePassword(16);
       const newSiteUrl = `https://${t.subdomain}.${account.domain}`;
+      // URL via domaine principal — accessible immédiatement sans attendre le DNS du sous-domaine
+      const unpackerBaseUrl = t.subdomain
+        ? `https://${account.domain}/${t.subdomain}`
+        : `https://${account.domain}`;
 
       // Provision DB via cPanel (best-effort — may already exist)
       try {
@@ -139,6 +144,7 @@ export async function POST(req: NextRequest) {
         newDbUser,
         newDbPass,
         newSiteUrl,
+        unpackerBaseUrl,
       });
     }
 

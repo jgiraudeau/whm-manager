@@ -757,6 +757,7 @@ export interface RunMigrationTargetParams {
     newDbUser: string;
     newDbPass: string;
     newSiteUrl: string;
+    unpackerBaseUrl?: string; // URL via domaine principal (sans DNS du sous-domaine)
   };
 }
 
@@ -820,7 +821,9 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
 
     // 4. Call unpacker (P2P transfer + restore)
     await log(jobId, targetUser, "Transfert P2P + extraction + import SQL + patch config…");
-    const unpackerPublicUrl = `${target.newSiteUrl.replace(/\/$/, "")}/${unpackerDir}/agent.php`;
+    // Prefer unpackerBaseUrl (via main domain, DNS-instant) over newSiteUrl (subdomain, may lag)
+    const unpackerBase = (target.unpackerBaseUrl ?? target.newSiteUrl).replace(/\/$/, "");
+    const unpackerPublicUrl = `${unpackerBase}/${unpackerDir}/agent.php`;
     const { targetUrl } = await callUnpackerUnpack(unpackerPublicUrl, unpackerToken, 20 * 60 * 1000);
     await log(jobId, targetUser, `✅ Migration terminée → ${targetUrl}`);
 
