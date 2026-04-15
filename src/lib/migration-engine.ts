@@ -642,7 +642,7 @@ export async function callPackerPack(
   try {
     json = JSON.parse(text) as Record<string, unknown>;
   } catch {
-    throw new Error(`Packer returned non-JSON: ${text.slice(0, 200)}`);
+    throw new Error(`Packer returned non-JSON (HTTP ${res.status}) URL=${packerUrl} — ${text.slice(0, 300)}`);
   }
 
   if (json.error) throw new Error(`Packer error: ${json.error}`);
@@ -801,7 +801,7 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
     packerFileName = packer.packerFileName;
     packerToken = packer.packerToken;
     packerUrl = packer.packerPublicUrl;
-    await log(jobId, targetUser, `Agent packer déployé : ${packerFileName}`);
+    await log(jobId, targetUser, `Agent packer déployé : ${packerFileName} → ${packerUrl}`);
 
     // 2. Call packer to create ZIP + SQL dump
     await log(jobId, targetUser, "Compression des fichiers et export SQL (peut prendre 1-5 min)…");
