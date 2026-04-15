@@ -410,7 +410,7 @@ if ($action !== 'unpack') {
 
 // ── Step 1: Download ZIP from packer (P2P)
 $zipPath = sys_get_temp_dir() . '/whm_unpack_' . md5(AGENT_TOKEN) . '.zip';
-$ch = curl_init(PACKER_URL . '&action=download&token=' . PACKER_TOKEN);
+$ch = curl_init(PACKER_URL . '?action=download&token=' . PACKER_TOKEN);
 curl_setopt_array($ch, [
     CURLOPT_RETURNTRANSFER => false,
     CURLOPT_FILE           => fopen($zipPath, 'wb'),
