@@ -341,7 +341,9 @@ if ($action === 'pack_batch') {
         @unlink(WORK_FILE);
         $done = ['status' => 'done', 'zipName' => ZIP_NAME, 'zipSize' => $zipSize,
             'dbName' => $work['dbName'] ?? '', 'dbHost' => $work['dbHost'] ?? 'localhost',
-            'tablePrefix' => $work['tablePrefix'] ?? 'wp_', 'ts' => time()];
+            'tablePrefix' => $work['tablePrefix'] ?? 'wp_',
+            'skipped_count' => $skippedCount ?? 0, 'skipped_bytes' => $skippedBytes ?? 0,
+            'ts' => time()];
         ws($done);
         echo json_encode($done);
         exit;
@@ -368,8 +370,10 @@ if ($action === 'pack_batch') {
     //   one file per call, guaranteed ≤ 50MB → ≤ 5s read + 5s write at 10MB/s.
     //   Files > 50MB are skipped.
     $newOffset  = $offset;
-    $batchBytes = 0;
-    $batchEnd   = min($offset + BATCH_SIZE, $total);
+    $batchBytes   = 0;
+    $skippedBytes = (int)($statusData['skipped_bytes'] ?? 0);
+    $skippedCount = (int)($statusData['skipped_count'] ?? 0);
+    $batchEnd     = min($offset + BATCH_SIZE, $total);
 
     for ($i = $offset; $i < $batchEnd; $i++) {
         [$fp, $rel] = $files[$i];
@@ -380,8 +384,13 @@ if ($action === 'pack_batch') {
         $fileSize = (int)@filesize($fp);
         if ($fileSize <= 0) continue; // empty or unreadable
 
-        // Skip files > 50MB (too large to process safely in one HTTP call on shared hosting)
-        if ($fileSize > 50 * 1024 * 1024) continue;
+        // Skip files individually > MAX_BATCH_BYTES — a solo read+write of this file
+        // must complete in ~3-4s on shared NFS. At 3MB/s NFS: 10MB read+write = 6s < 15s.
+        if ($fileSize > MAX_BATCH_BYTES) {
+            $skippedCount++;
+            $skippedBytes += $fileSize;
+            continue;
+        }
 
         // If batch already has data and this file would overflow → stop, next call handles it
         if ($batchBytes > 0 && $batchBytes + $fileSize > MAX_BATCH_BYTES) break;
@@ -414,13 +423,18 @@ if ($action === 'pack_batch') {
         @unlink(WORK_FILE);
         $done = ['status' => 'done', 'zipName' => ZIP_NAME, 'zipSize' => $zipSize,
             'dbName' => $work['dbName'] ?? '', 'dbHost' => $work['dbHost'] ?? 'localhost',
-            'tablePrefix' => $work['tablePrefix'] ?? 'wp_', 'ts' => time()];
+            'tablePrefix' => $work['tablePrefix'] ?? 'wp_',
+            'skipped_count' => $skippedCount ?? 0, 'skipped_bytes' => $skippedBytes ?? 0,
+            'ts' => time()];
         ws($done);
         echo json_encode($done);
     } else {
         // More batches needed — update STATUS only (WORK_FILE is immutable, never rewritten)
-        ws(['status' => 'zipping', 'step' => 'creating_zip', 'offset' => $newOffset, 'total' => $total, 'ts' => time()]);
-        echo json_encode(['status' => 'zipping', 'offset' => $newOffset, 'total' => $total]);
+        ws(['status' => 'zipping', 'step' => 'creating_zip',
+            'offset' => $newOffset, 'total' => $total,
+            'skipped_count' => $skippedCount, 'skipped_bytes' => $skippedBytes, 'ts' => time()]);
+        echo json_encode(['status' => 'zipping', 'offset' => $newOffset, 'total' => $total,
+            'skipped_count' => $skippedCount, 'skipped_bytes' => $skippedBytes]);
     }
     exit;
 }
