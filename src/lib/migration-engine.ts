@@ -740,14 +740,19 @@ export interface DeployPackerResult {
  * Deploy the packer agent to the source account.
  * The PHP file is placed directly in sourcePath (no subdirectory needed).
  * Returns the public URL to call the packer.
+ *
+ * Pass existingToken to redeploy with the same token (e.g. after the file was
+ * deleted by a WordPress security scanner) — the existing WORK_FILE, STATUS_FILE
+ * and ZIP in /home/user/ are keyed by md5(token) and will be reused seamlessly.
  */
 export async function deployPackerAgent(
   sourceUser: string,
   sourcePath: string,
   sourceBaseUrl: string,
   appType: AppType,
+  existingToken?: string,
 ): Promise<DeployPackerResult> {
-  const token = randomToken(32);
+  const token = existingToken ?? randomToken(32);
   const fileName = `whm_packer_${randomToken(8)}.php`;
   const relDir = toHomeRelative(sourceUser, sourcePath);
 
@@ -765,13 +770,17 @@ export async function deployPackerAgent(
  * Drive the chunked packer: call ?action=pack (init), then loop ?action=pack_batch
  * until status=done. Each call completes in seconds — no background process needed.
  *
- * Accepts an optional onProgress callback to log batch progress.
+ * onProgress: called with each batch progress message.
+ * onRedeploy: called when the packer PHP file is detected as deleted (WordPress security
+ *   scanner removes unknown PHP files). Should re-upload the packer with the SAME token
+ *   and return the new URL. State files (WORK_FILE, STATUS_FILE, ZIP) survive in /home/user/.
  */
 export async function callPackerPack(
   packerUrl: string,
   packerToken: string,
   timeoutMs = 15 * 60 * 1000,
   onProgress?: (msg: string) => void | Promise<void>,
+  onRedeploy?: () => Promise<string>,
 ): Promise<{
   dbName: string;
   dbHost: string;
@@ -811,14 +820,35 @@ export async function callPackerPack(
   // 2. Loop pack_batch until done
   const deadline = Date.now() + timeoutMs;
   let lastOffset = -1;
+  let currentPackerUrl = packerUrl;
+  let redeployCount = 0;
+  const MAX_REDEPLOYS = 5;
 
   while (Date.now() < deadline) {
     const batchRes = await fetchWithTimeout(
-      `${packerUrl}?token=${tokenParam}&action=pack_batch`,
+      `${currentPackerUrl}?token=${tokenParam}&action=pack_batch`,
       {},
       60_000,
     );
     const batchText = await batchRes.text();
+
+    // Detect packer file deletion: WordPress security scanners (Wordfence etc.)
+    // delete unknown PHP files in public_html after ~30s. The response then
+    // becomes the WordPress 404 page (HTML, HTTP 200).
+    // Recovery: redeploy with same token → WORK_FILE + STATUS_FILE + ZIP survive
+    // in /home/user/ and are keyed by md5(token), so we resume at the right offset.
+    if (batchText.trimStart().startsWith("<")) {
+      if (!onRedeploy || redeployCount >= MAX_REDEPLOYS) {
+        throw new Error(
+          `Packer batch returned non-JSON (HTTP ${batchRes.status}) — ${batchText.slice(0, 300)}`,
+        );
+      }
+      redeployCount++;
+      if (onProgress) await onProgress(`Packer supprimé par scanner WP, re-déploiement #${redeployCount}…`);
+      currentPackerUrl = await onRedeploy();
+      continue; // retry batch with new URL, same offset
+    }
+
     let batchJson: Record<string, unknown>;
     try {
       batchJson = JSON.parse(batchText) as Record<string, unknown>;
@@ -1010,6 +1040,14 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
       packerToken,
       15 * 60 * 1000,
       (msg) => log(jobId, targetUser, msg),
+      // onRedeploy: redeploy packer with SAME token so WORK_FILE/STATUS_FILE/ZIP are reused
+      async () => {
+        const rePacker = await deployPackerAgent(sourceUser, sourcePath, sourceUrl, appType, packerToken);
+        packerFileName = rePacker.packerFileName;
+        packerUrl = rePacker.packerPublicUrl;
+        await log(jobId, targetUser, `Packer re-déployé → ${packerUrl}`);
+        return rePacker.packerPublicUrl;
+      },
     );
     const zipMb = (packResult.zipSize / 1024 / 1024).toFixed(1);
     await log(jobId, targetUser, `Archive créée — ${zipMb} Mo (${packResult.zipName})`);
