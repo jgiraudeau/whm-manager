@@ -177,7 +177,7 @@ define('SQL_PATH',    HOME_DIR . 'whm_dump_' . substr(md5(AGENT_TOKEN), 0, 8) . 
 define('STATUS_FILE', HOME_DIR . 'whm_status_' . substr(md5(AGENT_TOKEN), 0, 8) . '.json');
 define('WORK_FILE',   HOME_DIR . 'whm_work_'   . substr(md5(AGENT_TOKEN), 0, 8) . '.json');
 define('BATCH_SIZE',     500);             // theoretical max per call (data-bounded loop stops earlier)
-define('MAX_BATCH_BYTES', 15 * 1024 * 1024); // stop when batch reaches 15MB — close() writes this in ~2-3s on NFS
+define('MAX_BATCH_BYTES', 10 * 1024 * 1024); // stop when batch reaches 10MB — close() writes this in ~1-2s on NFS
 define('MAX_BATCH_SECS',  5.0);            // hard time fallback (pre-read check)
 
 function ws($data) { file_put_contents(STATUS_FILE, json_encode($data)); }
@@ -312,6 +312,8 @@ if ($action === 'pack') {
 // ?action=pack_batch — Step 2 (repeated): add next batch of files to ZIP
 // ════════════════════════════════════════════════════════════
 if ($action === 'pack_batch') {
+    $batchStartTime = microtime(true); // start timer before ALL I/O (WORK_FILE read included)
+
     if (!file_exists(WORK_FILE)) {
         echo json_encode(['error' => 'Work file not found — call ?action=pack first']);
         exit;
@@ -347,24 +349,38 @@ if ($action === 'pack_batch') {
         exit;
     }
 
-    // Limits:
-    //   MAX_BATCH_BYTES — ensures close() writes at most ~15MB → ~2-3s on NFS
-    //   MAX_BATCH_SECS  — hard fallback, checked BEFORE reading each file
-    // Both limits stop the loop before file_get_contents of the next file,
-    // so close() never writes more data than we explicitly read in this call.
-    $batchStartTime = microtime(true);
+    // Strategy: check filesize() BEFORE file_get_contents so we never read
+    // a file that alone would overflow the batch budget.
+    //
+    // Limits per batch call:
+    //   MAX_BATCH_BYTES (10MB) — stops before reading a file that would push
+    //     total above budget. The very first file is still bounded because
+    //     we skip files individually > MAX_BATCH_BYTES.
+    //   MAX_BATCH_SECS (5s)    — hard time fallback (pre-read).
+    //
+    // Files individually > MAX_BATCH_BYTES are split into solo batches:
+    //   one file per call, guaranteed ≤ 50MB → ≤ 5s read + 5s write at 10MB/s.
+    //   Files > 50MB are skipped.
     $newOffset  = $offset;
     $batchBytes = 0;
     $batchEnd   = min($offset + BATCH_SIZE, $total);
 
     for ($i = $offset; $i < $batchEnd; $i++) {
         [$fp, $rel] = $files[$i];
-        $newOffset = $i + 1; // always advance, even for skipped files
+        $newOffset = $i + 1; // always advance
 
         if (!file_exists($fp)) continue;
 
-        // Pre-read checks — stop BEFORE loading the next file into memory
-        if ($batchBytes >= MAX_BATCH_BYTES) break;
+        $fileSize = (int)@filesize($fp);
+        if ($fileSize <= 0) continue; // empty or unreadable
+
+        // Skip files > 50MB (too large to process safely in one HTTP call on shared hosting)
+        if ($fileSize > 50 * 1024 * 1024) continue;
+
+        // If batch already has data and this file would overflow → stop, next call handles it
+        if ($batchBytes > 0 && $batchBytes + $fileSize > MAX_BATCH_BYTES) break;
+
+        // Time pre-check (only after at least one file has been read)
         if ($batchBytes > 0 && (microtime(true) - $batchStartTime) > MAX_BATCH_SECS) break;
 
         $content = @file_get_contents($fp);
@@ -372,11 +388,14 @@ if ($action === 'pack_batch') {
 
         $zip->addFromString($rel, $content);
         $zip->setCompressionIndex($zip->numFiles - 1, 0); // CM_STORE
-        $batchBytes += strlen($content);
+        $batchBytes += $fileSize;
         unset($content);
+
+        // If first file was already at/above budget, stop here (solo large-file batch)
+        if ($batchBytes >= MAX_BATCH_BYTES) break;
     }
 
-    $zip->close(); // writes exactly $batchBytes of data — bounded and predictable
+    $zip->close(); // writes at most MAX_BATCH_BYTES of data
 
     if ($newOffset >= $total) {
         // All files added — done!
