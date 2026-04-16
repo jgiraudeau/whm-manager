@@ -293,11 +293,11 @@ if ($action === 'pack') {
     unset($sqlContent);
     $zip->close();
 
-    // ── Save work file with file list + DB info
+    // ── Save work file with file list + DB info (immutable — never rewritten after this)
+    // Offset is tracked separately in STATUS_FILE (small, fast to write on every batch)
     $total = count($fileList);
     file_put_contents(WORK_FILE, json_encode([
         'files'       => $fileList,
-        'offset'      => 0,
         'dbName'      => $dbName,
         'dbHost'      => $dbHost,
         'tablePrefix' => $tablePrefix,
@@ -319,15 +319,21 @@ if ($action === 'pack_batch') {
         exit;
     }
 
+    // Read offset from STATUS_FILE (small, a few KB — fast write/read every batch)
+    // WORK_FILE is immutable (written once in pack_init) — avoid rewriting it
+    $statusData = file_exists(STATUS_FILE)
+        ? (@json_decode(file_get_contents(STATUS_FILE), true) ?? [])
+        : [];
+    $offset = (int)($statusData['offset'] ?? 0);
+
     $work = @json_decode(file_get_contents(WORK_FILE), true);
     if (!$work || !isset($work['files'])) {
         echo json_encode(['error' => 'Invalid work file']);
         exit;
     }
 
-    $files  = $work['files'];
-    $offset = (int)($work['offset'] ?? 0);
-    $total  = count($files);
+    $files = $work['files'];
+    $total = count($files);
 
     if ($offset >= $total) {
         // Already done — just finalize
@@ -412,9 +418,7 @@ if ($action === 'pack_batch') {
         ws($done);
         echo json_encode($done);
     } else {
-        // More batches needed — update offset
-        $work['offset'] = $newOffset;
-        file_put_contents(WORK_FILE, json_encode($work));
+        // More batches needed — update STATUS only (WORK_FILE is immutable, never rewritten)
         ws(['status' => 'zipping', 'step' => 'creating_zip', 'offset' => $newOffset, 'total' => $total, 'ts' => time()]);
         echo json_encode(['status' => 'zipping', 'offset' => $newOffset, 'total' => $total]);
     }
