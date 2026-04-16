@@ -822,7 +822,7 @@ export async function callPackerPack(
   let lastOffset = -1;
   let currentPackerUrl = packerUrl;
   let redeployCount = 0;
-  const MAX_REDEPLOYS = 5;
+  const MAX_REDEPLOYS = 20;
 
   while (Date.now() < deadline) {
     const batchRes = await fetchWithTimeout(
