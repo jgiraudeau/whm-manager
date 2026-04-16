@@ -176,7 +176,8 @@ define('ZIP_PATH',    HOME_DIR . ZIP_NAME);
 define('SQL_PATH',    HOME_DIR . 'whm_dump_' . substr(md5(AGENT_TOKEN), 0, 8) . '.sql');
 define('STATUS_FILE', HOME_DIR . 'whm_status_' . substr(md5(AGENT_TOKEN), 0, 8) . '.json');
 define('WORK_FILE',   HOME_DIR . 'whm_work_'   . substr(md5(AGENT_TOKEN), 0, 8) . '.json');
-define('BATCH_SIZE',  150);
+define('BATCH_SIZE',  300);   // theoretical max — time-bounded loop stops earlier
+define('MAX_BATCH_SECS', 6.0); // stop adding files after 6s; close() writes what's in memory
 
 function ws($data) { file_put_contents(STATUS_FILE, json_encode($data)); }
 
@@ -339,15 +340,27 @@ if ($action === 'pack_batch') {
         exit;
     }
 
-    $batch = array_slice($files, $offset, BATCH_SIZE);
-    foreach ($batch as [$fp, $rel]) {
-        if (!file_exists($fp)) continue;
-        $zip->addFile($fp, $rel);
-        $zip->setCompressionIndex($zip->numFiles - 1, 0); // CM_STORE
-    }
-    $zip->close();
+    // Use addFromString() + time-bounded loop so close() only writes data
+    // already in memory — avoids PHP-FPM timeout on large files.
+    // addFile() defers all disk reads to close(), which is unpredictable.
+    $batchStartTime = microtime(true);
+    $newOffset = $offset;
+    $batchEnd  = min($offset + BATCH_SIZE, $total);
 
-    $newOffset = $offset + count($batch);
+    for ($i = $offset; $i < $batchEnd; $i++) {
+        [$fp, $rel] = $files[$i];
+        $newOffset = $i + 1; // always advance, even for skipped files
+        if (!file_exists($fp)) continue;
+        $content = @file_get_contents($fp);
+        if ($content === false) continue;
+        $zip->addFromString($rel, $content);
+        $zip->setCompressionIndex($zip->numFiles - 1, 0); // CM_STORE
+        unset($content);
+        // Stop adding files if approaching time limit — close() writes what's in memory
+        if ((microtime(true) - $batchStartTime) > MAX_BATCH_SECS) break;
+    }
+
+    $zip->close(); // writes only data already read into memory — bounded time
 
     if ($newOffset >= $total) {
         // All files added — done!
