@@ -458,18 +458,52 @@ if ($action === 'status') {
     exit;
 }
 
-// ── Download ZIP
+// ── Download ZIP size (for chunked download by unpacker)
+if ($action === 'download_size') {
+    if (!file_exists(ZIP_PATH)) {
+        http_response_code(404);
+        echo json_encode(['error' => 'ZIP not found']);
+        exit;
+    }
+    echo json_encode(['size' => filesize(ZIP_PATH), 'name' => ZIP_NAME]);
+    exit;
+}
+
+// ── Download ZIP (supports HTTP Range for chunked download)
 if ($action === 'download') {
     if (!file_exists(ZIP_PATH)) {
         http_response_code(404);
         echo json_encode(['error' => 'ZIP not found']);
         exit;
     }
+    $fileSize = filesize(ZIP_PATH);
+    $start = 0;
+    $end   = $fileSize - 1;
+
+    if (!empty($_SERVER['HTTP_RANGE'])) {
+        preg_match('/bytes=(\d+)-(\d*)/', $_SERVER['HTTP_RANGE'], $rm);
+        $start = (int)$rm[1];
+        $end   = ($rm[2] !== '') ? (int)$rm[2] : $fileSize - 1;
+        $end   = min($end, $fileSize - 1);
+        http_response_code(206);
+        header('Content-Range: bytes ' . $start . '-' . $end . '/' . $fileSize);
+    }
+    $length = $end - $start + 1;
     header('Content-Type: application/zip');
-    header('Content-Length: ' . filesize(ZIP_PATH));
+    header('Content-Length: ' . $length);
+    header('Accept-Ranges: bytes');
     header('Content-Disposition: attachment; filename="' . ZIP_NAME . '"');
     ob_end_clean();
-    readfile(ZIP_PATH);
+    $fp = fopen(ZIP_PATH, 'rb');
+    fseek($fp, $start);
+    $rem = $length;
+    while ($rem > 0 && !feof($fp)) {
+        $buf = min(65536, $rem);
+        echo fread($fp, $buf);
+        $rem -= $buf;
+        flush();
+    }
+    fclose($fp);
     exit;
 }
 
@@ -489,14 +523,19 @@ echo json_encode(['error' => 'Unknown action']);
 }
 
 /**
- * Generates the PHP "unpacker" agent.
- * When called with ?token=TOKEN, it:
- *  1. Downloads the ZIP from the packer URL (P2P cURL)
- *  2. Creates a new MySQL database + user on the target cPanel (via php exec of mysqladmin or via pre-created DB info)
- *  3. Extracts the ZIP into destPath
- *  4. Imports the SQL
- *  5. Patches wp-config.php (or PrestaShop config) with new DB credentials and new siteUrl
- *  6. Cleans up + self-deletes
+ * Generates the PHP "unpacker" agent — chunked multi-step architecture.
+ *
+ * Actions (called sequentially by TS orchestrator):
+ *   ?action=download_init   → get ZIP size from packer, create local ZIP file
+ *   ?action=download_chunk  → fetch 5 MB via cURL Range, append to local ZIP
+ *                             Pass &packer_url=... to override when packer was redeployed.
+ *   ?action=extract_batch   → extract up to N entries per call (time-bounded, <10s each)
+ *   ?action=import_sql      → exec mysql to import _whm_export.sql
+ *   ?action=patch_config    → patch wp-config / PrestaShop config + URL search-replace in DB
+ *   ?action=cleanup         → delete local ZIP + self-delete + signal packer cleanup
+ *
+ * The unpacker is deployed to the target account's main public_html (not the subdomain dir)
+ * to avoid the subdomain vhost not-yet-ready 502. DEST_PATH is still the subdomain dir.
  */
 function buildUnpackerPhp(params: {
   token: string;
@@ -509,11 +548,12 @@ function buildUnpackerPhp(params: {
   newDbPass: string;
   newSiteUrl: string;
   oldSiteUrl: string;
+  targetUser: string;
 }): string {
-  const e = (s: string) => s.replace(/'/g, "\\'");
+  const e = (s: string) => s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   return `<?php
 error_reporting(0);
-set_time_limit(0);
+set_time_limit(30);
 ini_set('memory_limit', '512M');
 
 define('AGENT_TOKEN',  '${e(params.token)}');
@@ -526,6 +566,9 @@ define('NEW_DB_USER',  '${e(params.newDbUser)}');
 define('NEW_DB_PASS',  '${e(params.newDbPass)}');
 define('NEW_SITE_URL', '${e(params.newSiteUrl)}');
 define('OLD_SITE_URL', '${e(params.oldSiteUrl)}');
+define('HOME_DIR',     '/home/${e(params.targetUser)}/');
+define('LOCAL_ZIP',    HOME_DIR . 'whm_dl_' . substr(md5(AGENT_TOKEN), 0, 8) . '.zip');
+define('DL_CHUNK',     5 * 1024 * 1024); // 5 MB per download chunk
 
 header('Content-Type: application/json');
 
@@ -535,187 +578,217 @@ if (!isset($_GET['token']) || $_GET['token'] !== AGENT_TOKEN) {
     exit;
 }
 
-$action = $_GET['action'] ?? 'unpack';
+$action = $_GET['action'] ?? 'download_init';
 
+// ════════════════════════════════════════════════════════════
+// ?action=cleanup
+// ════════════════════════════════════════════════════════════
 if ($action === 'cleanup') {
+    @unlink(LOCAL_ZIP);
+    // Signal packer to delete its ZIP + status files
+    $cu = PACKER_URL . '?action=cleanup&token=' . urlencode(PACKER_TOKEN);
+    @file_get_contents($cu);
     @unlink(__FILE__);
     echo json_encode(['success' => true, 'action' => 'cleanup']);
     exit;
 }
 
-if ($action !== 'unpack') {
-    http_response_code(400);
-    echo json_encode(['error' => 'Unknown action']);
-    exit;
-}
+// ════════════════════════════════════════════════════════════
+// ?action=download_init — get ZIP total size, create local file
+// ════════════════════════════════════════════════════════════
+if ($action === 'download_init') {
+    @unlink(LOCAL_ZIP);
+    file_put_contents(LOCAL_ZIP, ''); // create/reset
 
-// ── Step 1: Download ZIP via packer download action (ZIP stored in home dir, served by packer)
-$zipPath = sys_get_temp_dir() . '/whm_unpack_' . md5(AGENT_TOKEN) . '.zip';
-$downloadUrl = PACKER_URL . '?action=download&token=' . urlencode(PACKER_TOKEN);
-$ch = curl_init($downloadUrl);
-curl_setopt_array($ch, [
-    CURLOPT_RETURNTRANSFER => false,
-    CURLOPT_FILE           => fopen($zipPath, 'wb'),
-    CURLOPT_FOLLOWLOCATION => true,
-    CURLOPT_SSL_VERIFYPEER => false,
-    CURLOPT_SSL_VERIFYHOST => false,
-    CURLOPT_TIMEOUT        => 600,
-]);
-curl_exec($ch);
-$curlError = curl_error($ch);
-$httpCode  = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-curl_close($ch);
-
-$downloadedSize = file_exists($zipPath) ? filesize($zipPath) : 0;
-if ($curlError || $httpCode !== 200 || $downloadedSize < 100) {
-    @unlink($zipPath);
-    echo json_encode(['error' => 'Failed to download ZIP from packer (HTTP ' . $httpCode . ', size=' . $downloadedSize . '): ' . $curlError]);
-    exit;
-}
-
-// Verify ZIP magic bytes (PK = 50 4B 03 04)
-$magic = file_get_contents($zipPath, false, null, 0, 4);
-if ($magic !== "PK\x03\x04") {
-    $preview = substr(file_get_contents($zipPath, false, null, 0, 500), 0, 500);
-    @unlink($zipPath);
-    echo json_encode(['error' => 'Downloaded file is not a valid ZIP (size=' . $downloadedSize . ', magic=' . bin2hex($magic) . '). Content preview: ' . $preview]);
-    exit;
-}
-
-// ── Step 2: Validate destination dir
-if (!is_dir(DEST_PATH)) {
-    if (!mkdir(DEST_PATH, 0755, true)) {
-        @unlink($zipPath);
-        echo json_encode(['error' => 'Cannot create destination directory: ' . DEST_PATH]);
+    $sizeUrl = PACKER_URL . '?action=download_size&token=' . urlencode(PACKER_TOKEN);
+    $ctx = stream_context_create(['ssl' => ['verify_peer' => false, 'verify_peer_name' => false]]);
+    $resp = @file_get_contents($sizeUrl, false, $ctx);
+    $data = $resp ? @json_decode($resp, true) : null;
+    if (!$data || empty($data['size'])) {
+        echo json_encode(['error' => 'Cannot get ZIP size from packer: ' . substr((string)$resp, 0, 200)]);
         exit;
     }
-}
-
-// ── Step 3: Extract ZIP
-if (!class_exists('ZipArchive')) {
-    @unlink($zipPath);
-    echo json_encode(['error' => 'ZipArchive not available']);
-    exit;
-}
-$zip = new ZipArchive();
-if ($zip->open($zipPath) !== true) {
-    @unlink($zipPath);
-    echo json_encode(['error' => 'Cannot open downloaded ZIP']);
-    exit;
-}
-$zip->extractTo(DEST_PATH);
-$zip->close();
-@unlink($zipPath);
-
-// ── Step 4: Import SQL
-$sqlPath = DEST_PATH . '/_whm_export.sql';
-if (!file_exists($sqlPath)) {
-    echo json_encode(['error' => 'SQL dump not found in archive (_whm_export.sql)']);
+    echo json_encode(['total_size' => (int)$data['size'], 'downloaded' => 0]);
     exit;
 }
 
-// Get old DB credentials from the extracted config (for search-replace)
-$oldDbName = '';
-$oldDbUser = '';
-$oldDbPass = '';
-$oldDbHost = 'localhost';
-$tablePrefix = 'wp_';
+// ════════════════════════════════════════════════════════════
+// ?action=download_chunk&downloaded=N&total=T[&packer_url=URL]
+// ════════════════════════════════════════════════════════════
+if ($action === 'download_chunk') {
+    $downloaded = (int)($_GET['downloaded'] ?? 0);
+    $totalSize  = (int)($_GET['total']      ?? 0);
+    // Allow packer URL override (packer may have been redeployed by TS orchestrator)
+    $dlBase     = !empty($_GET['packer_url']) ? $_GET['packer_url'] : PACKER_URL;
 
-if (APP_TYPE === 'wordpress') {
-    $configFile = DEST_PATH . '/wp-config.php';
-    if (file_exists($configFile)) {
-        $conf = file_get_contents($configFile);
-        if (preg_match("/define\\s*\\(\\s*'DB_NAME'\\s*,\\s*'([^']+)'/", $conf, $m)) $oldDbName = $m[1];
-        if (preg_match("/define\\s*\\(\\s*'DB_USER'\\s*,\\s*'([^']+)'/", $conf, $m)) $oldDbUser = $m[1];
-        if (preg_match("/define\\s*\\(\\s*'DB_PASSWORD'\\s*,\\s*'([^']+)'/", $conf, $m)) $oldDbPass = $m[1];
-        if (preg_match("/define\\s*\\(\\s*'DB_HOST'\\s*,\\s*'([^']+)'/", $conf, $m)) $oldDbHost = $m[1];
-        if (preg_match("/\\\\$table_prefix\\s*=\\s*'([^']+)'/", $conf, $m)) $tablePrefix = $m[1];
-    }
-}
-
-$importCmd = sprintf(
-    'mysql -h %s -u %s %s %s < %s 2>&1',
-    escapeshellarg('localhost'),
-    escapeshellarg(NEW_DB_USER),
-    '-p' . escapeshellarg(NEW_DB_PASS),
-    escapeshellarg(NEW_DB_NAME),
-    escapeshellarg($sqlPath)
-);
-exec($importCmd, $importOut, $importCode);
-@unlink($sqlPath);
-
-if ($importCode !== 0) {
-    echo json_encode(['error' => 'mysql import failed (code ' . $importCode . '): ' . implode(' ', $importOut)]);
-    exit;
-}
-
-// ── Step 5: Patch configuration files
-if (APP_TYPE === 'wordpress') {
-    $configFile = DEST_PATH . '/wp-config.php';
-    if (file_exists($configFile)) {
-        $conf = file_get_contents($configFile);
-        $conf = preg_replace("/define\\s*\\(\\s*'DB_NAME'\\s*,\\s*'[^']*'/", "define('DB_NAME', '" . addslashes(NEW_DB_NAME) . "'", $conf);
-        $conf = preg_replace("/define\\s*\\(\\s*'DB_USER'\\s*,\\s*'[^']*'/", "define('DB_USER', '" . addslashes(NEW_DB_USER) . "'", $conf);
-        $conf = preg_replace("/define\\s*\\(\\s*'DB_PASSWORD'\\s*,\\s*'[^']*'/", "define('DB_PASSWORD', '" . addslashes(NEW_DB_PASS) . "'", $conf);
-        $conf = preg_replace("/define\\s*\\(\\s*'DB_HOST'\\s*,\\s*'[^']*'/", "define('DB_HOST', 'localhost'", $conf);
-        file_put_contents($configFile, $conf);
+    if ($downloaded >= $totalSize) {
+        echo json_encode(['downloaded' => $downloaded, 'total' => $totalSize, 'done' => true]);
+        exit;
     }
 
-    // Search-replace old siteurl → new siteurl in the DB
-    $pdo = new PDO('mysql:host=localhost;dbname=' . NEW_DB_NAME, NEW_DB_USER, NEW_DB_PASS);
-    $oldUrl = rtrim(OLD_SITE_URL, '/');
-    $newUrl = rtrim(NEW_SITE_URL, '/');
+    $rangeEnd = min($downloaded + DL_CHUNK - 1, $totalSize - 1);
+    $dlUrl = $dlBase . '?action=download&token=' . urlencode(PACKER_TOKEN);
 
-    // Update wp_options (siteurl + home)
-    $pdo->exec("UPDATE " . $tablePrefix . "options SET option_value = REPLACE(option_value, " . $pdo->quote($oldUrl) . ", " . $pdo->quote($newUrl) . ") WHERE option_name IN ('siteurl','home')");
+    $fp = fopen(LOCAL_ZIP, 'ab');
+    $ch = curl_init($dlUrl);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => false,
+        CURLOPT_FILE           => $fp,
+        CURLOPT_RANGE          => $downloaded . '-' . $rangeEnd,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_TIMEOUT        => 30,
+    ]);
+    curl_exec($ch);
+    $curlErr  = curl_error($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    fclose($fp);
 
-    // Update wp_posts (guid + post_content)
-    $pdo->exec("UPDATE " . $tablePrefix . "posts SET guid = REPLACE(guid, " . $pdo->quote($oldUrl) . ", " . $pdo->quote($newUrl) . ")");
-    $pdo->exec("UPDATE " . $tablePrefix . "posts SET post_content = REPLACE(post_content, " . $pdo->quote($oldUrl) . ", " . $pdo->quote($newUrl) . ")");
-
-    // Update wp_postmeta
-    $pdo->exec("UPDATE " . $tablePrefix . "postmeta SET meta_value = REPLACE(meta_value, " . $pdo->quote($oldUrl) . ", " . $pdo->quote($newUrl) . ")");
-
-} elseif (APP_TYPE === 'prestashop') {
-    // PrestaShop: patch parameters.php and DB configuration table
-    $paramFiles = [
-        DEST_PATH . '/app/config/parameters.php',
-    ];
-    foreach ($paramFiles as $pf) {
-        if (!file_exists($pf)) continue;
-        $conf = file_get_contents($pf);
-        $conf = preg_replace("/'database_name'\\s*=>\\s*'[^']*'/", "'database_name' => '" . addslashes(NEW_DB_NAME) . "'", $conf);
-        $conf = preg_replace("/'database_user'\\s*=>\\s*'[^']*'/", "'database_user' => '" . addslashes(NEW_DB_USER) . "'", $conf);
-        $conf = preg_replace("/'database_password'\\s*=>\\s*'[^']*'/", "'database_password' => '" . addslashes(NEW_DB_PASS) . "'", $conf);
-        $conf = preg_replace("/'database_host'\\s*=>\\s*'[^']*'/", "'database_host' => 'localhost'", $conf);
-        file_put_contents($pf, $conf);
+    if ($curlErr || ($httpCode !== 206 && $httpCode !== 200)) {
+        // Packer may have been deleted by WP scanner — signal TS to redeploy
+        echo json_encode(['packer_gone' => true,
+            'error' => 'Download chunk failed HTTP ' . $httpCode . ': ' . $curlErr]);
+        exit;
     }
-    // Also patch PS_SHOP_DOMAIN in DB
-    try {
-        $pdo = new PDO('mysql:host=localhost;dbname=' . NEW_DB_NAME, NEW_DB_USER, NEW_DB_PASS);
-        $parsed = parse_url(NEW_SITE_URL);
-        $newDomain = $parsed['host'] ?? '';
-        if ($newDomain) {
-            $pdo->exec("UPDATE ps_configuration SET value = " . $pdo->quote($newDomain) . " WHERE name IN ('PS_SHOP_DOMAIN','PS_SHOP_DOMAIN_SSL')");
-            $pdo->exec("UPDATE ps_shop_url SET domain = " . $pdo->quote($newDomain) . ", domain_ssl = " . $pdo->quote($newDomain));
+
+    $newDl = file_exists(LOCAL_ZIP) ? filesize(LOCAL_ZIP) : 0;
+    echo json_encode(['downloaded' => $newDl, 'total' => $totalSize, 'done' => ($newDl >= $totalSize)]);
+    exit;
+}
+
+// ════════════════════════════════════════════════════════════
+// ?action=extract_batch&start=N — extract next batch of ZIP entries
+// ════════════════════════════════════════════════════════════
+if ($action === 'extract_batch') {
+    $start = (int)($_GET['start'] ?? 0);
+
+    if (!file_exists(LOCAL_ZIP)) {
+        echo json_encode(['error' => 'Local ZIP not found — download first']);
+        exit;
+    }
+    $zip = new ZipArchive();
+    if ($zip->open(LOCAL_ZIP) !== true) {
+        echo json_encode(['error' => 'Cannot open downloaded ZIP']);
+        exit;
+    }
+
+    $total = $zip->numFiles;
+    $t0 = microtime(true);
+    $i  = $start;
+
+    for (; $i < $total; $i++) {
+        // Stop before PHP-FPM kills us (leave 2s buffer)
+        if ($i > $start && (microtime(true) - $t0) > 8.0) break;
+
+        $name = $zip->getNameIndex($i);
+        if ($name === false) continue;
+
+        // Directory entry
+        if (substr($name, -1) === '/') {
+            @mkdir(DEST_PATH . '/' . $name, 0755, true);
+            continue;
         }
-    } catch (Exception $e) {
-        // non-fatal
+
+        $dst = DEST_PATH . '/' . $name;
+        @mkdir(dirname($dst), 0755, true);
+        $content = $zip->getFromIndex($i);
+        if ($content !== false) {
+            file_put_contents($dst, $content);
+            unset($content);
+        }
     }
+
+    $zip->close();
+    $done = ($i >= $total);
+    if ($done) @unlink(LOCAL_ZIP);
+
+    echo json_encode(['extracted' => $i, 'total' => $total, 'done' => $done]);
+    exit;
 }
 
-// ── Step 6: Self delete + signal packer to cleanup
-@unlink(__FILE__);
+// ════════════════════════════════════════════════════════════
+// ?action=import_sql — exec mysql import
+// ════════════════════════════════════════════════════════════
+if ($action === 'import_sql') {
+    $sqlPath = DEST_PATH . '/_whm_export.sql';
+    if (!file_exists($sqlPath)) {
+        echo json_encode(['error' => 'SQL dump not found: ' . $sqlPath]);
+        exit;
+    }
+    $cmd = sprintf('mysql -h %s -u %s -p%s %s < %s 2>&1',
+        escapeshellarg('localhost'),
+        escapeshellarg(NEW_DB_USER),
+        escapeshellarg(NEW_DB_PASS),
+        escapeshellarg(NEW_DB_NAME),
+        escapeshellarg($sqlPath));
+    exec($cmd, $out, $code);
+    @unlink($sqlPath);
+    if ($code !== 0) {
+        echo json_encode(['error' => 'mysql import failed (' . $code . '): ' . implode(' ', $out)]);
+        exit;
+    }
+    echo json_encode(['success' => true, 'action' => 'import_sql']);
+    exit;
+}
 
-// Signal packer to cleanup its ZIP
-$cleanupUrl = PACKER_URL . '&action=cleanup&token=' . PACKER_TOKEN;
-@file_get_contents($cleanupUrl);
+// ════════════════════════════════════════════════════════════
+// ?action=patch_config — patch config files + URL search-replace in DB
+// ════════════════════════════════════════════════════════════
+if ($action === 'patch_config') {
+    $tablePrefix = 'wp_';
 
-echo json_encode([
-    'success'    => true,
-    'targetUrl'  => NEW_SITE_URL,
-    'message'    => 'Migration completed successfully',
-]);
+    if (APP_TYPE === 'wordpress') {
+        $cf = DEST_PATH . '/wp-config.php';
+        if (file_exists($cf)) {
+            $c = file_get_contents($cf);
+            if (preg_match('/\\$table_prefix\\s*=\\s*\'([^\']+)\'/', $c, $m)) $tablePrefix = $m[1];
+            $c = preg_replace("/define\\s*\\(\\s*'DB_NAME'\\s*,\\s*'[^']*'/",     "define('DB_NAME', '"     . addslashes(NEW_DB_NAME) . "'", $c);
+            $c = preg_replace("/define\\s*\\(\\s*'DB_USER'\\s*,\\s*'[^']*'/",     "define('DB_USER', '"     . addslashes(NEW_DB_USER) . "'", $c);
+            $c = preg_replace("/define\\s*\\(\\s*'DB_PASSWORD'\\s*,\\s*'[^']*'/", "define('DB_PASSWORD', '" . addslashes(NEW_DB_PASS) . "'", $c);
+            $c = preg_replace("/define\\s*\\(\\s*'DB_HOST'\\s*,\\s*'[^']*'/",     "define('DB_HOST', 'localhost'",                            $c);
+            file_put_contents($cf, $c);
+        }
+        try {
+            $pdo = new PDO('mysql:host=localhost;dbname=' . NEW_DB_NAME, NEW_DB_USER, NEW_DB_PASS);
+            $old = rtrim(OLD_SITE_URL, '/');
+            $new = rtrim(NEW_SITE_URL, '/');
+            $pdo->exec("UPDATE {$tablePrefix}options SET option_value = REPLACE(option_value, " . $pdo->quote($old) . ", " . $pdo->quote($new) . ") WHERE option_name IN ('siteurl','home')");
+            $pdo->exec("UPDATE {$tablePrefix}posts SET guid = REPLACE(guid, "         . $pdo->quote($old) . ", " . $pdo->quote($new) . ")");
+            $pdo->exec("UPDATE {$tablePrefix}posts SET post_content = REPLACE(post_content, " . $pdo->quote($old) . ", " . $pdo->quote($new) . ")");
+            $pdo->exec("UPDATE {$tablePrefix}postmeta SET meta_value = REPLACE(meta_value, " . $pdo->quote($old) . ", " . $pdo->quote($new) . ")");
+        } catch (Exception $ex) {
+            echo json_encode(['error' => 'DB patch failed: ' . $ex->getMessage()]);
+            exit;
+        }
+    } elseif (APP_TYPE === 'prestashop') {
+        foreach ([DEST_PATH . '/app/config/parameters.php'] as $pf) {
+            if (!file_exists($pf)) continue;
+            $c = file_get_contents($pf);
+            $c = preg_replace("/'database_name'\\s*=>\\s*'[^']*'/",     "'database_name' => '"     . addslashes(NEW_DB_NAME) . "'", $c);
+            $c = preg_replace("/'database_user'\\s*=>\\s*'[^']*'/",     "'database_user' => '"     . addslashes(NEW_DB_USER) . "'", $c);
+            $c = preg_replace("/'database_password'\\s*=>\\s*'[^']*'/", "'database_password' => '" . addslashes(NEW_DB_PASS) . "'", $c);
+            $c = preg_replace("/'database_host'\\s*=>\\s*'[^']*'/",     "'database_host' => 'localhost'",                           $c);
+            file_put_contents($pf, $c);
+        }
+        try {
+            $pdo = new PDO('mysql:host=localhost;dbname=' . NEW_DB_NAME, NEW_DB_USER, NEW_DB_PASS);
+            $parsed = parse_url(NEW_SITE_URL);
+            $newDomain = $parsed['host'] ?? '';
+            if ($newDomain) {
+                $pdo->exec("UPDATE ps_configuration SET value = " . $pdo->quote($newDomain) . " WHERE name IN ('PS_SHOP_DOMAIN','PS_SHOP_DOMAIN_SSL')");
+                $pdo->exec("UPDATE ps_shop_url SET domain = " . $pdo->quote($newDomain) . ", domain_ssl = " . $pdo->quote($newDomain));
+            }
+        } catch (Exception $ex) { /* non-fatal */ }
+    }
+
+    echo json_encode(['success' => true, 'targetUrl' => NEW_SITE_URL]);
+    exit;
+}
+
+http_response_code(400);
+echo json_encode(['error' => 'Unknown action: ' . htmlspecialchars($action ?? '')]);
 `;
 }
 
@@ -917,10 +990,15 @@ export async function deployUnpackerAgent(params: {
   const fileName = `whm_unpacker_${randomToken(8)}.php`;
 
   // Ensure destination directory exists (subdomain dir may not be created yet)
-  const relDestDir = toHomeRelative(params.targetUser, params.destPath);
   await createDirectoryCpanel(params.targetUser, params.destPath);
 
-  // Upload agent directly into the destination directory
+  // Deploy to main domain public_html root (NOT the subdomain dir).
+  // The subdomain vhost is freshly created and may not be ready yet — accessing
+  // public_html/subdir/ via the main domain returns 502 until the vhost is live.
+  // The unpacker writes files to DEST_PATH (subdomain dir) but is itself served
+  // from the main domain root where PHP-FPM is always available.
+  const mainPublicHtml = `public_html`;
+
   const content = buildUnpackerPhp({
     token,
     packerUrl: params.packerUrl,
@@ -932,36 +1010,115 @@ export async function deployUnpackerAgent(params: {
     newDbPass: params.newDbPass,
     newSiteUrl: params.newSiteUrl,
     oldSiteUrl: params.oldSiteUrl,
+    targetUser: params.targetUser,
   });
 
-  await uploadFileToCpanel(params.targetUser, relDestDir, fileName, content);
+  await uploadFileToCpanel(params.targetUser, mainPublicHtml, fileName, content);
 
   return { unpackerFileName: fileName, unpackerToken: token };
 }
 
 /**
- * Call the unpacker to download + extract + import + patch.
+ * Drive the chunked unpacker: download → extract → import → patch → cleanup.
+ *
+ * Each step is a separate HTTP call to the unpacker agent, all completing in <15s.
+ * onProgress: called with each step message.
+ * onPackerRedeploy: called when download_chunk signals packer_gone (WP scanner deleted
+ *   the packer during the download phase). Returns new packer URL so next chunk can use it.
  */
 export async function callUnpackerUnpack(
   unpackerUrl: string,
   unpackerToken: string,
-  timeoutMs = 20 * 60 * 1000,
+  timeoutMs = 30 * 60 * 1000,
+  onProgress?: (msg: string) => void | Promise<void>,
+  onPackerRedeploy?: () => Promise<string>,
 ): Promise<{ targetUrl: string }> {
-  const url = `${unpackerUrl}?token=${encodeURIComponent(unpackerToken)}&action=unpack`;
-  const res = await fetchWithTimeout(url, {}, timeoutMs);
-  const text = await res.text();
+  const tp = encodeURIComponent(unpackerToken);
+  const deadline = Date.now() + timeoutMs;
+  const MAX_REDEPLOYS = 20;
 
-  let json: Record<string, unknown>;
-  try {
-    json = JSON.parse(text) as Record<string, unknown>;
-  } catch {
-    throw new Error(`Unpacker returned non-JSON: ${text.slice(0, 200)}`);
+  async function call(action: string, extra = ""): Promise<Record<string, unknown>> {
+    const res = await fetchWithTimeout(`${unpackerUrl}?token=${tp}&action=${action}${extra}`, {}, 60_000);
+    const text = await res.text();
+    if (text.trimStart().startsWith("<")) {
+      throw new Error(`Unpacker returned HTML (HTTP ${res.status}) for action=${action} — ${text.slice(0, 200)}`);
+    }
+    let j: Record<string, unknown>;
+    try { j = JSON.parse(text) as Record<string, unknown>; }
+    catch { throw new Error(`Unpacker non-JSON for action=${action}: ${text.slice(0, 200)}`); }
+    return j;
   }
 
-  if (json.error) throw new Error(`Unpacker error: ${json.error}`);
-  if (!json.success) throw new Error(`Unpacker failed: ${JSON.stringify(json)}`);
+  // ── 1. Init download
+  const init = await call("download_init");
+  if (init.error) throw new Error(`Unpacker download_init: ${init.error}`);
+  const totalSize = Number(init.total_size ?? 0);
+  if (onProgress) await onProgress(`Téléchargement ZIP (${(totalSize / 1024 / 1024).toFixed(1)} Mo)…`);
 
-  return { targetUrl: String(json.targetUrl ?? "") };
+  // ── 2. Download chunks
+  let downloaded = 0;
+  let redeployCount = 0;
+  let currentPackerUrl = ""; // empty = use PACKER_URL hardcoded in PHP
+
+  while (downloaded < totalSize && Date.now() < deadline) {
+    const packerParam = currentPackerUrl
+      ? `&packer_url=${encodeURIComponent(currentPackerUrl)}`
+      : "";
+    const chunk = await call(
+      "download_chunk",
+      `&downloaded=${downloaded}&total=${totalSize}${packerParam}`,
+    );
+
+    if (chunk.packer_gone) {
+      if (!onPackerRedeploy || redeployCount >= MAX_REDEPLOYS) {
+        throw new Error(`Packer unreachable during download (${redeployCount} redeploys tried)`);
+      }
+      redeployCount++;
+      if (onProgress) await onProgress(`Packer supprimé (download), re-déploiement #${redeployCount}…`);
+      currentPackerUrl = await onPackerRedeploy();
+      continue;
+    }
+
+    if (chunk.error) throw new Error(`Unpacker download_chunk: ${chunk.error}`);
+    downloaded = Number(chunk.downloaded ?? downloaded);
+    if (onProgress) {
+      await onProgress(
+        `Téléchargement ${(downloaded / 1024 / 1024).toFixed(1)}/${(totalSize / 1024 / 1024).toFixed(1)} Mo…`,
+      );
+    }
+    if (chunk.done) break;
+  }
+  if (downloaded < totalSize) {
+    throw new Error(`Download incomplete: ${downloaded}/${totalSize} bytes`);
+  }
+
+  // ── 3. Extract batch loop
+  if (onProgress) await onProgress("Extraction des fichiers…");
+  let extractStart = 0;
+  while (Date.now() < deadline) {
+    const ex = await call("extract_batch", `&start=${extractStart}`);
+    if (ex.error) throw new Error(`Unpacker extract_batch: ${ex.error}`);
+    extractStart = Number(ex.extracted ?? extractStart);
+    const exTotal = Number(ex.total ?? 0);
+    if (onProgress) await onProgress(`Extraction ${extractStart}/${exTotal} fichiers…`);
+    if (ex.done) break;
+  }
+
+  // ── 4. Import SQL
+  if (onProgress) await onProgress("Import SQL…");
+  const sql = await call("import_sql");
+  if (sql.error) throw new Error(`Unpacker import_sql: ${sql.error}`);
+
+  // ── 5. Patch config
+  if (onProgress) await onProgress("Patch configuration + URLs…");
+  const patch = await call("patch_config");
+  if (patch.error) throw new Error(`Unpacker patch_config: ${patch.error}`);
+  const targetUrl = String(patch.targetUrl ?? "");
+
+  // ── 6. Cleanup (best-effort)
+  await call("cleanup").catch(() => null);
+
+  return { targetUrl };
 }
 
 /**
@@ -1062,7 +1219,17 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
     const zipMb = (packResult.zipSize / 1024 / 1024).toFixed(1);
     await log(jobId, targetUser, `Archive créée — ${zipMb} Mo (${packResult.zipName})`);
 
-    // 3. Deploy unpacker directly into destination directory
+    // 3. Re-deploy packer to ensure it's alive for the P2P download phase
+    // (WP scanner may have deleted the PHP file during packing)
+    {
+      const dlPacker = await deployPackerAgent(sourceUser, sourcePath, sourceUrl, appType, packerToken);
+      packerFileName = dlPacker.packerFileName;
+      packerUrl = dlPacker.packerPublicUrl;
+      await log(jobId, targetUser, `Packer re-déployé pour la phase download → ${packerUrl}`);
+    }
+
+    // 4. Deploy unpacker to target account's main domain public_html root
+    // (deployed there to avoid 502 from not-yet-ready subdomain vhost)
     await log(jobId, targetUser, "Déploiement de l'agent unpacker sur le compte cible…");
     const unpacker = await deployUnpackerAgent({
       targetUser,
@@ -1081,10 +1248,23 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
     unpackerToken = unpacker.unpackerToken;
     await log(jobId, targetUser, `Agent unpacker déployé : ${unpackerFileName}`);
 
-    // 4. Call unpacker — P2P download + extract + import SQL + patch config
-    await log(jobId, targetUser, "Transfert P2P + extraction + import SQL + patch config…");
+    // 5. Drive chunked unpacker: download → extract → import SQL → patch → cleanup
+    // Unpacker is at main domain root, not subdomain path
     const unpackerPublicUrl = `${unpackerBaseUrl}/${unpackerFileName}`;
-    const { targetUrl } = await callUnpackerUnpack(unpackerPublicUrl, unpackerToken, 20 * 60 * 1000);
+    const { targetUrl } = await callUnpackerUnpack(
+      unpackerPublicUrl,
+      unpackerToken,
+      30 * 60 * 1000,
+      (msg) => log(jobId, targetUser, msg),
+      // onPackerRedeploy: redeploy with same token if WP scanner deletes it during download
+      async () => {
+        const rePacker = await deployPackerAgent(sourceUser, sourcePath, sourceUrl, appType, packerToken);
+        packerFileName = rePacker.packerFileName;
+        packerUrl = rePacker.packerPublicUrl;
+        await log(jobId, targetUser, `Packer re-déployé (download) → ${packerUrl}`);
+        return rePacker.packerPublicUrl;
+      },
+    );
     await log(jobId, targetUser, `✅ Migration terminée → ${targetUrl}`);
 
     await updateMigrationTarget(jobId, targetUser, {
@@ -1112,7 +1292,7 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
             ? deleteFromCpanel(sourceUser, `${sourcePath}/${packerFileName}`, "file")
             : Promise.resolve(),
           unpackerFileName
-            ? deleteFromCpanel(targetUser, `${target.destPath}/${unpackerFileName}`, "file")
+            ? deleteFromCpanel(targetUser, `/home/${targetUser}/public_html/${unpackerFileName}`, "file")
             : Promise.resolve(),
         ]);
       } catch {

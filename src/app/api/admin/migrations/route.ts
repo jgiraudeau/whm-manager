@@ -100,10 +100,9 @@ export async function POST(req: NextRequest) {
       const newDbUser = `${t.user}_${dbSuffix}`;
       const newDbPass = generatePassword(16);
       const newSiteUrl = `https://${t.subdomain}.${account.domain}`;
-      // URL via domaine principal — accessible immédiatement sans attendre le DNS du sous-domaine
-      const unpackerBaseUrl = t.subdomain
-        ? `https://${account.domain}/${t.subdomain}`
-        : `https://${account.domain}`;
+      // Unpacker deployed to main domain public_html root — always accessible,
+      // unlike the subdomain vhost which may not be ready immediately after creation.
+      const unpackerBaseUrl = `https://${account.domain}`;
 
       // Provision DB via cPanel (best-effort — may already exist)
       try {
