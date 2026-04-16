@@ -176,8 +176,9 @@ define('ZIP_PATH',    HOME_DIR . ZIP_NAME);
 define('SQL_PATH',    HOME_DIR . 'whm_dump_' . substr(md5(AGENT_TOKEN), 0, 8) . '.sql');
 define('STATUS_FILE', HOME_DIR . 'whm_status_' . substr(md5(AGENT_TOKEN), 0, 8) . '.json');
 define('WORK_FILE',   HOME_DIR . 'whm_work_'   . substr(md5(AGENT_TOKEN), 0, 8) . '.json');
-define('BATCH_SIZE',  300);   // theoretical max — time-bounded loop stops earlier
-define('MAX_BATCH_SECS', 6.0); // stop adding files after 6s; close() writes what's in memory
+define('BATCH_SIZE',     500);             // theoretical max per call (data-bounded loop stops earlier)
+define('MAX_BATCH_BYTES', 15 * 1024 * 1024); // stop when batch reaches 15MB — close() writes this in ~2-3s on NFS
+define('MAX_BATCH_SECS',  5.0);            // hard time fallback (pre-read check)
 
 function ws($data) { file_put_contents(STATUS_FILE, json_encode($data)); }
 
@@ -272,19 +273,25 @@ if ($action === 'pack') {
         $fileList[] = [$fp, $rel];
     }
 
-    // ── Create ZIP, add SQL dump as first entry
+    // ── Create ZIP, add SQL dump as first entry (addFromString so close() is bounded)
     @unlink(ZIP_PATH);
+    $sqlContent = @file_get_contents(SQL_PATH);
+    @unlink(SQL_PATH);
+    if ($sqlContent === false || strlen($sqlContent) < 10) {
+        ws(['status' => 'error', 'error' => 'Cannot read SQL dump', 'ts' => time()]);
+        echo json_encode(['error' => 'Cannot read SQL dump']);
+        exit;
+    }
     $zip = new ZipArchive();
     if ($zip->open(ZIP_PATH, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
-        @unlink(SQL_PATH);
         ws(['status' => 'error', 'error' => 'Cannot create ZIP file', 'ts' => time()]);
         echo json_encode(['error' => 'Cannot create ZIP file']);
         exit;
     }
-    $zip->addFile(SQL_PATH, '_whm_export.sql');
+    $zip->addFromString('_whm_export.sql', $sqlContent);
     $zip->setCompressionIndex(0, 0);
+    unset($sqlContent);
     $zip->close();
-    @unlink(SQL_PATH);
 
     // ── Save work file with file list + DB info
     $total = count($fileList);
@@ -340,27 +347,36 @@ if ($action === 'pack_batch') {
         exit;
     }
 
-    // Use addFromString() + time-bounded loop so close() only writes data
-    // already in memory — avoids PHP-FPM timeout on large files.
-    // addFile() defers all disk reads to close(), which is unpredictable.
+    // Limits:
+    //   MAX_BATCH_BYTES — ensures close() writes at most ~15MB → ~2-3s on NFS
+    //   MAX_BATCH_SECS  — hard fallback, checked BEFORE reading each file
+    // Both limits stop the loop before file_get_contents of the next file,
+    // so close() never writes more data than we explicitly read in this call.
     $batchStartTime = microtime(true);
-    $newOffset = $offset;
-    $batchEnd  = min($offset + BATCH_SIZE, $total);
+    $newOffset  = $offset;
+    $batchBytes = 0;
+    $batchEnd   = min($offset + BATCH_SIZE, $total);
 
     for ($i = $offset; $i < $batchEnd; $i++) {
         [$fp, $rel] = $files[$i];
         $newOffset = $i + 1; // always advance, even for skipped files
+
         if (!file_exists($fp)) continue;
+
+        // Pre-read checks — stop BEFORE loading the next file into memory
+        if ($batchBytes >= MAX_BATCH_BYTES) break;
+        if ($batchBytes > 0 && (microtime(true) - $batchStartTime) > MAX_BATCH_SECS) break;
+
         $content = @file_get_contents($fp);
         if ($content === false) continue;
+
         $zip->addFromString($rel, $content);
         $zip->setCompressionIndex($zip->numFiles - 1, 0); // CM_STORE
+        $batchBytes += strlen($content);
         unset($content);
-        // Stop adding files if approaching time limit — close() writes what's in memory
-        if ((microtime(true) - $batchStartTime) > MAX_BATCH_SECS) break;
     }
 
-    $zip->close(); // writes only data already read into memory — bounded time
+    $zip->close(); // writes exactly $batchBytes of data — bounded and predictable
 
     if ($newOffset >= $total) {
         // All files added — done!
