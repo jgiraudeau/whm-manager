@@ -142,16 +142,17 @@ async function deleteFromCpanel(user: string, fullPath: string, type: "file" | "
 /**
  * Generates the PHP "packer" agent.
  *
- * Architecture: background CLI process to bypass PHP-FPM request_terminate_timeout.
+ * Architecture: chunked HTTP calls — no background process needed.
+ * Each action completes well under PHP-FPM request_terminate_timeout (~15s).
  *
  * Web actions:
- *   ?action=pack    → launch background PHP CLI process, return immediately {"started":true}
- *   ?action=status  → read status file, return current state (starting|running|done|error)
- *   ?action=download → serve ZIP from home dir
- *   ?action=cleanup  → delete ZIP + status file + self
- *
- * CLI mode (invoked by exec nohup): does the actual mysqldump + ZipArchive work,
- * writes progress to STATUS_FILE, writes final result when done.
+ *   ?action=pack       → read DB config + mysqldump + enumerate files → write WORK_FILE
+ *                        → create ZIP with SQL dump → status {step:'zipping', offset:0, total:N}
+ *   ?action=pack_batch → add next batch of files to ZIP → update status offset
+ *                        → when offset >= total: status=done
+ *   ?action=status     → read STATUS_FILE, return current state
+ *   ?action=download   → serve ZIP from home dir
+ *   ?action=cleanup    → delete ZIP + status file + work file + self
  */
 function buildPackerPhp(token: string, sourceUser: string, sourcePath: string, appType: AppType): string {
   const e = (s: string) => s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
@@ -161,8 +162,10 @@ function buildPackerPhp(token: string, sourceUser: string, sourcePath: string, a
   const appLabel = appType === "wordpress" ? "wordpress" : "prestashop";
 
   return `<?php
-// WHM Manager — Packer Agent (auto-generated)
+// WHM Manager — Packer Agent (auto-generated, chunked mode)
 error_reporting(0);
+set_time_limit(60);
+header('Content-Type: application/json');
 
 define('AGENT_TOKEN', '${escapedToken}');
 define('SOURCE_PATH', '${escapedPath}');
@@ -172,15 +175,33 @@ define('HOME_DIR',    '/home/${escapedUser}/');
 define('ZIP_PATH',    HOME_DIR . ZIP_NAME);
 define('SQL_PATH',    HOME_DIR . 'whm_dump_' . substr(md5(AGENT_TOKEN), 0, 8) . '.sql');
 define('STATUS_FILE', HOME_DIR . 'whm_status_' . substr(md5(AGENT_TOKEN), 0, 8) . '.json');
+define('WORK_FILE',   HOME_DIR . 'whm_work_'   . substr(md5(AGENT_TOKEN), 0, 8) . '.json');
+define('BATCH_SIZE',  150);
+
+function ws($data) { file_put_contents(STATUS_FILE, json_encode($data)); }
+
+if (!isset($_GET['token']) || $_GET['token'] !== AGENT_TOKEN) {
+    http_response_code(403);
+    echo json_encode(['error' => 'Forbidden']);
+    exit;
+}
+
+$action = $_GET['action'] ?? 'pack';
 
 // ════════════════════════════════════════════════════════════
-// CLI background mode — runs via: nohup php -f packer.php
+// ?action=pack — Step 1: read config + mysqldump + enumerate files
 // ════════════════════════════════════════════════════════════
-if (php_sapi_name() === 'cli') {
-    set_time_limit(0);
-    ini_set('memory_limit', '512M');
-
-    function ws($data) { file_put_contents(STATUS_FILE, json_encode($data)); }
+if ($action === 'pack') {
+    // Idempotent: if already done or in progress, return current status
+    if (file_exists(STATUS_FILE)) {
+        $existing = @json_decode(file_get_contents(STATUS_FILE), true);
+        $st = $existing['status'] ?? '';
+        if (in_array($st, ['zipping', 'done', 'error'], true)) {
+            echo json_encode(['started' => true, 'status' => $st,
+                'offset' => $existing['offset'] ?? 0, 'total' => $existing['total'] ?? 0]);
+            exit;
+        }
+    }
 
     ws(['status' => 'running', 'step' => 'reading_config', 'ts' => time()]);
 
@@ -215,7 +236,8 @@ if (php_sapi_name() === 'cli') {
 
     if (!$dbName || !$dbUser) {
         ws(['status' => 'error', 'error' => 'Cannot read DB credentials from config', 'ts' => time()]);
-        exit(1);
+        echo json_encode(['error' => 'Cannot read DB credentials from config']);
+        exit;
     }
 
     // ── mysqldump
@@ -227,24 +249,15 @@ if (php_sapi_name() === 'cli') {
     exec($dumpCmd, $dOut, $dCode);
     if ($dCode !== 0 || !file_exists(SQL_PATH) || filesize(SQL_PATH) < 10) {
         @unlink(SQL_PATH);
-        ws(['status' => 'error', 'error' => 'mysqldump failed (code ' . $dCode . ')', 'ts' => time()]);
-        exit(1);
+        ws(['status' => 'error', 'error' => 'mysqldump failed (code ' . $dCode . '): ' . implode(' ', $dOut), 'ts' => time()]);
+        echo json_encode(['error' => 'mysqldump failed (code ' . $dCode . ')']);
+        exit;
     }
 
-    // ── ZipArchive (no compression = CM_STORE, saves CPU)
-    ws(['status' => 'running', 'step' => 'creating_zip', 'ts' => time()]);
-    @unlink(ZIP_PATH);
-    $zip = new ZipArchive();
-    if ($zip->open(ZIP_PATH, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
-        @unlink(SQL_PATH);
-        ws(['status' => 'error', 'error' => 'Cannot create ZIP file', 'ts' => time()]);
-        exit(1);
-    }
-
-    $zip->addFile(SQL_PATH, '_whm_export.sql');
-    $zip->setCompressionIndex(0, 0); // CM_STORE for SQL dump
-
+    // ── Enumerate files (store list in WORK_FILE for chunked processing)
+    ws(['status' => 'running', 'step' => 'enumerating_files', 'ts' => time()]);
     $EXCL = ['wp-content/cache', 'wp-content/upgrade', 'var/cache', 'cache', 'var/logs', 'var/sessions'];
+    $fileList = [];
     $iter = new RecursiveIteratorIterator(
         new RecursiveDirectoryIterator(SOURCE_PATH, RecursiveDirectoryIterator::SKIP_DOTS),
         RecursiveIteratorIterator::LEAVES_ONLY
@@ -252,66 +265,111 @@ if (php_sapi_name() === 'cli') {
     foreach ($iter as $file) {
         if ($file->isDir()) continue;
         $fp  = $file->getRealPath();
-        if (!$fp || $fp === ZIP_PATH || $fp === SQL_PATH || $fp === STATUS_FILE) continue;
+        if (!$fp || $fp === ZIP_PATH || $fp === SQL_PATH || $fp === STATUS_FILE || $fp === WORK_FILE) continue;
         $rel = ltrim(substr($fp, strlen(SOURCE_PATH)), DIRECTORY_SEPARATOR);
         foreach ($EXCL as $x) { if (strpos($rel, $x) === 0) continue 2; }
-        $zip->addFile($fp, $rel);
-        $zip->setCompressionIndex($zip->numFiles - 1, 0); // CM_STORE — no CPU compression
+        $fileList[] = [$fp, $rel];
     }
 
+    // ── Create ZIP, add SQL dump as first entry
+    @unlink(ZIP_PATH);
+    $zip = new ZipArchive();
+    if ($zip->open(ZIP_PATH, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+        @unlink(SQL_PATH);
+        ws(['status' => 'error', 'error' => 'Cannot create ZIP file', 'ts' => time()]);
+        echo json_encode(['error' => 'Cannot create ZIP file']);
+        exit;
+    }
+    $zip->addFile(SQL_PATH, '_whm_export.sql');
+    $zip->setCompressionIndex(0, 0);
     $zip->close();
     @unlink(SQL_PATH);
 
-    $zipSize = file_exists(ZIP_PATH) ? filesize(ZIP_PATH) : 0;
-    if ($zipSize < 100) {
-        ws(['status' => 'error', 'error' => 'ZIP too small (' . $zipSize . ' bytes)', 'ts' => time()]);
-        exit(1);
-    }
-
-    ws([
-        'status'      => 'done',
-        'zipName'     => ZIP_NAME,
-        'zipSize'     => $zipSize,
+    // ── Save work file with file list + DB info
+    $total = count($fileList);
+    file_put_contents(WORK_FILE, json_encode([
+        'files'       => $fileList,
+        'offset'      => 0,
         'dbName'      => $dbName,
         'dbHost'      => $dbHost,
         'tablePrefix' => $tablePrefix,
-        'ts'          => time(),
-    ]);
-    exit(0);
-}
+    ]));
 
-// ════════════════════════════════════════════════════════════
-// WEB mode — short-lived HTTP requests only
-// ════════════════════════════════════════════════════════════
-set_time_limit(60);
-header('Content-Type: application/json');
-
-if (!isset($_GET['token']) || $_GET['token'] !== AGENT_TOKEN) {
-    http_response_code(403);
-    echo json_encode(['error' => 'Forbidden']);
+    ws(['status' => 'zipping', 'step' => 'creating_zip', 'offset' => 0, 'total' => $total, 'ts' => time()]);
+    echo json_encode(['started' => true, 'status' => 'zipping', 'offset' => 0, 'total' => $total]);
     exit;
 }
 
-$action = $_GET['action'] ?? 'pack';
-
-// ── Launch background pack process
-if ($action === 'pack') {
-    $existing = file_exists(STATUS_FILE) ? @json_decode(file_get_contents(STATUS_FILE), true) : null;
-    if ($existing && in_array($existing['status'] ?? '', ['running', 'done', 'error'], true)) {
-        echo json_encode(['started' => true, 'status' => $existing['status'] ?? 'unknown']);
+// ════════════════════════════════════════════════════════════
+// ?action=pack_batch — Step 2 (repeated): add next batch of files to ZIP
+// ════════════════════════════════════════════════════════════
+if ($action === 'pack_batch') {
+    if (!file_exists(WORK_FILE)) {
+        echo json_encode(['error' => 'Work file not found — call ?action=pack first']);
         exit;
     }
-    file_put_contents(STATUS_FILE, json_encode(['status' => 'starting', 'ts' => time()]));
 
-    // Find PHP binary
-    $phpBin = PHP_BINARY;
-    if (!$phpBin || !is_executable($phpBin)) {
-        foreach (['/usr/local/bin/php', '/usr/bin/php'] as $p) {
-            if (is_executable($p)) { $phpBin = $p; break; }
-        }
+    $work = @json_decode(file_get_contents(WORK_FILE), true);
+    if (!$work || !isset($work['files'])) {
+        echo json_encode(['error' => 'Invalid work file']);
+        exit;
     }
-    exec('nohup ' . escapeshellarg($phpBin) . ' -f ' . escapeshellarg(__FILE__) . ' > /dev/null 2>&1 &');
-    echo json_encode(['started' => true, 'status' => 'starting']);
+
+    $files  = $work['files'];
+    $offset = (int)($work['offset'] ?? 0);
+    $total  = count($files);
+
+    if ($offset >= $total) {
+        // Already done — just finalize
+        $zipSize = file_exists(ZIP_PATH) ? filesize(ZIP_PATH) : 0;
+        @unlink(WORK_FILE);
+        $done = ['status' => 'done', 'zipName' => ZIP_NAME, 'zipSize' => $zipSize,
+            'dbName' => $work['dbName'] ?? '', 'dbHost' => $work['dbHost'] ?? 'localhost',
+            'tablePrefix' => $work['tablePrefix'] ?? 'wp_', 'ts' => time()];
+        ws($done);
+        echo json_encode($done);
+        exit;
+    }
+
+    // Open existing ZIP in append mode
+    $zip = new ZipArchive();
+    if ($zip->open(ZIP_PATH, ZipArchive::CREATE) !== true) {
+        ws(['status' => 'error', 'error' => 'Cannot open ZIP for batch append', 'ts' => time()]);
+        echo json_encode(['error' => 'Cannot open ZIP for batch append']);
+        exit;
+    }
+
+    $batch = array_slice($files, $offset, BATCH_SIZE);
+    foreach ($batch as [$fp, $rel]) {
+        if (!file_exists($fp)) continue;
+        $zip->addFile($fp, $rel);
+        $zip->setCompressionIndex($zip->numFiles - 1, 0); // CM_STORE
+    }
+    $zip->close();
+
+    $newOffset = $offset + count($batch);
+
+    if ($newOffset >= $total) {
+        // All files added — done!
+        $zipSize = file_exists(ZIP_PATH) ? filesize(ZIP_PATH) : 0;
+        if ($zipSize < 100) {
+            ws(['status' => 'error', 'error' => 'ZIP too small (' . $zipSize . ' bytes)', 'ts' => time()]);
+            echo json_encode(['error' => 'ZIP too small (' . $zipSize . ' bytes)']);
+            exit;
+        }
+        @unlink(WORK_FILE);
+        $done = ['status' => 'done', 'zipName' => ZIP_NAME, 'zipSize' => $zipSize,
+            'dbName' => $work['dbName'] ?? '', 'dbHost' => $work['dbHost'] ?? 'localhost',
+            'tablePrefix' => $work['tablePrefix'] ?? 'wp_', 'ts' => time()];
+        ws($done);
+        echo json_encode($done);
+    } else {
+        // More batches needed — update offset
+        $work['offset'] = $newOffset;
+        file_put_contents(WORK_FILE, json_encode($work));
+        ws(['status' => 'zipping', 'step' => 'creating_zip', 'offset' => $newOffset, 'total' => $total, 'ts' => time()]);
+        echo json_encode(['status' => 'zipping', 'offset' => $newOffset, 'total' => $total]);
+    }
     exit;
 }
 
@@ -343,6 +401,7 @@ if ($action === 'download') {
 if ($action === 'cleanup') {
     @unlink(ZIP_PATH);
     @unlink(STATUS_FILE);
+    @unlink(WORK_FILE);
     @unlink(__FILE__);
     echo json_encode(['success' => true, 'action' => 'cleanup']);
     exit;
@@ -637,14 +696,16 @@ export async function deployPackerAgent(
 }
 
 /**
- * Launch the packer background process, then poll until done.
- * The packer ?action=pack starts a nohup CLI PHP process and returns immediately.
- * We then poll ?action=status every 10 seconds until status=done or status=error.
+ * Drive the chunked packer: call ?action=pack (init), then loop ?action=pack_batch
+ * until status=done. Each call completes in seconds — no background process needed.
+ *
+ * Accepts an optional onProgress callback to log batch progress.
  */
 export async function callPackerPack(
   packerUrl: string,
   packerToken: string,
   timeoutMs = 15 * 60 * 1000,
+  onProgress?: (msg: string) => void | Promise<void>,
 ): Promise<{
   dbName: string;
   dbHost: string;
@@ -652,54 +713,81 @@ export async function callPackerPack(
   zipName: string;
   zipSize: number;
 }> {
-  // 1. Launch background process (returns immediately)
-  const startUrl = `${packerUrl}?token=${encodeURIComponent(packerToken)}&action=pack`;
-  const startRes = await fetchWithTimeout(startUrl, {}, 30_000);
-  const startText = await startRes.text();
-  let startJson: Record<string, unknown>;
+  const tokenParam = encodeURIComponent(packerToken);
+
+  // 1. Init: read config + mysqldump + enumerate files → creates ZIP with SQL dump
+  const initRes = await fetchWithTimeout(
+    `${packerUrl}?token=${tokenParam}&action=pack`,
+    {},
+    60_000,
+  );
+  const initText = await initRes.text();
+  let initJson: Record<string, unknown>;
   try {
-    startJson = JSON.parse(startText) as Record<string, unknown>;
+    initJson = JSON.parse(initText) as Record<string, unknown>;
   } catch {
-    throw new Error(`Packer start returned non-JSON (HTTP ${startRes.status}) — ${startText.slice(0, 300)}`);
+    throw new Error(`Packer init returned non-JSON (HTTP ${initRes.status}) — ${initText.slice(0, 300)}`);
   }
-  if (startJson.error) throw new Error(`Packer start error: ${startJson.error}`);
+  if (initJson.error) throw new Error(`Packer init error: ${initJson.error}`);
 
-  // 2. Poll status every 10s
+  // If already done (idempotent re-call), return immediately
+  if (initJson.status === "done") {
+    return {
+      dbName:      String(initJson.dbName ?? ""),
+      dbHost:      String(initJson.dbHost ?? "localhost"),
+      tablePrefix: String(initJson.tablePrefix ?? "wp_"),
+      zipName:     String(initJson.zipName ?? ""),
+      zipSize:     Number(initJson.zipSize ?? 0),
+    };
+  }
+  if (initJson.error) throw new Error(`Packer init error: ${initJson.error}`);
+
+  // 2. Loop pack_batch until done
   const deadline = Date.now() + timeoutMs;
-  let lastStep = "";
+  let lastOffset = -1;
+
   while (Date.now() < deadline) {
-    await sleep(10_000);
-    const statusUrl = `${packerUrl}?token=${encodeURIComponent(packerToken)}&action=status`;
-    let statusJson: Record<string, unknown>;
+    const batchRes = await fetchWithTimeout(
+      `${packerUrl}?token=${tokenParam}&action=pack_batch`,
+      {},
+      60_000,
+    );
+    const batchText = await batchRes.text();
+    let batchJson: Record<string, unknown>;
     try {
-      const statusRes = await fetchWithTimeout(statusUrl, {}, 30_000);
-      const statusText = await statusRes.text();
-      statusJson = JSON.parse(statusText) as Record<string, unknown>;
+      batchJson = JSON.parse(batchText) as Record<string, unknown>;
     } catch {
-      continue; // status file may not exist yet — keep polling
+      throw new Error(`Packer batch returned non-JSON (HTTP ${batchRes.status}) — ${batchText.slice(0, 300)}`);
     }
 
-    const status = String(statusJson.status ?? "");
-    const step = String(statusJson.step ?? "");
-    if (step && step !== lastStep) {
-      lastStep = step;
-      console.log(`[packer] status=${status} step=${step}`);
+    if (batchJson.error) throw new Error(`Packer batch error: ${batchJson.error}`);
+
+    const offset = Number(batchJson.offset ?? 0);
+    const total  = Number(batchJson.total ?? 0);
+
+    // Log progress only when offset changes (avoid spamming)
+    if (offset !== lastOffset && onProgress) {
+      onProgress(`Compression ${offset}/${total} fichiers…`);
+      lastOffset = offset;
     }
 
-    if (status === "done") {
+    if (batchJson.status === "done") {
       return {
-        dbName: String(statusJson.dbName ?? ""),
-        dbHost: String(statusJson.dbHost ?? "localhost"),
-        tablePrefix: String(statusJson.tablePrefix ?? "wp_"),
-        zipName: String(statusJson.zipName ?? ""),
-        zipSize: Number(statusJson.zipSize ?? 0),
+        dbName:      String(batchJson.dbName ?? ""),
+        dbHost:      String(batchJson.dbHost ?? "localhost"),
+        tablePrefix: String(batchJson.tablePrefix ?? "wp_"),
+        zipName:     String(batchJson.zipName ?? ""),
+        zipSize:     Number(batchJson.zipSize ?? 0),
       };
     }
-    if (status === "error") {
-      throw new Error(`Packer background error: ${statusJson.error ?? "unknown"}`);
+    if (batchJson.status === "error") {
+      throw new Error(`Packer error: ${batchJson.error ?? "unknown"}`);
     }
-    // starting / running — keep polling
+
+    // Small pause to avoid hammering the server
+    await sleep(500);
   }
+
   throw new Error(`Packer timed out after ${Math.round(timeoutMs / 60000)} min`);
 }
 
@@ -851,7 +939,12 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
 
     // 2. Call packer to create ZIP + SQL dump (background process + polling)
     await log(jobId, targetUser, "Lancement compression arrière-plan (poll toutes les 10s, ~1-10 min)…");
-    const packResult = await callPackerPack(packerUrl, packerToken, 15 * 60 * 1000);
+    const packResult = await callPackerPack(
+      packerUrl,
+      packerToken,
+      15 * 60 * 1000,
+      (msg) => log(jobId, targetUser, msg),
+    );
     const zipMb = (packResult.zipSize / 1024 / 1024).toFixed(1);
     await log(jobId, targetUser, `Archive créée — ${zipMb} Mo (${packResult.zipName})`);
 
