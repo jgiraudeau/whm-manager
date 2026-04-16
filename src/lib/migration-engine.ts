@@ -315,6 +315,16 @@ if ($action === 'pack_batch') {
     $batchStartTime = microtime(true); // start timer before ALL I/O (WORK_FILE read included)
 
     if (!file_exists(WORK_FILE)) {
+        // WORK_FILE is deleted on successful completion. If packer was killed by WP scanner
+        // right after completing (before the HTTP response was sent), the STATUS_FILE still
+        // holds the full done payload — return it so the caller gets the right result.
+        $st = file_exists(STATUS_FILE)
+            ? (@json_decode(file_get_contents(STATUS_FILE), true) ?? [])
+            : [];
+        if (($st['status'] ?? '') === 'done') {
+            echo json_encode($st);
+            exit;
+        }
         echo json_encode(['error' => 'Work file not found — call ?action=pack first']);
         exit;
     }
