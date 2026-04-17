@@ -556,23 +556,33 @@ error_reporting(0);
 set_time_limit(30);
 ini_set('memory_limit', '512M');
 
-define('AGENT_TOKEN',  '${e(params.token)}');
-define('PACKER_URL',   '${e(params.packerUrl)}');
-define('PACKER_TOKEN', '${e(params.packerToken)}');
-define('DEST_PATH',    '${e(params.destPath)}');
-define('APP_TYPE',     '${params.appType}');
-define('NEW_DB_NAME',  '${e(params.newDbName)}');
-define('NEW_DB_USER',  '${e(params.newDbUser)}');
-define('NEW_DB_PASS',  '${e(params.newDbPass)}');
-define('NEW_SITE_URL', '${e(params.newSiteUrl)}');
-define('OLD_SITE_URL', '${e(params.oldSiteUrl)}');
-define('HOME_DIR',     '/home/${e(params.targetUser)}/');
-define('LOCAL_ZIP',    HOME_DIR . 'whm_dl_' . substr(md5(AGENT_TOKEN), 0, 8) . '.zip');
-define('DL_CHUNK',     5 * 1024 * 1024); // 5 MB per download chunk
+// Capture PHP fatal errors (incl. out-of-memory, exec failures) as JSON
+register_shutdown_function(function() {
+    $e = error_get_last();
+    if ($e && in_array($e['type'], [E_ERROR, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
+        if (!headers_sent()) { header('Content-Type: application/json'); }
+        echo json_encode(['fatal' => $e['message'], 'file' => basename($e['file']), 'line' => $e['line']]);
+    }
+});
+
+// Configuration — plain variables (not constants) to avoid define() function-call restrictions
+$AGENT_TOKEN  = '${e(params.token)}';
+$PACKER_URL   = '${e(params.packerUrl)}';
+$PACKER_TOKEN = '${e(params.packerToken)}';
+$DEST_PATH    = '${e(params.destPath)}';
+$APP_TYPE     = '${params.appType}';
+$NEW_DB_NAME  = '${e(params.newDbName)}';
+$NEW_DB_USER  = '${e(params.newDbUser)}';
+$NEW_DB_PASS  = '${e(params.newDbPass)}';
+$NEW_SITE_URL = '${e(params.newSiteUrl)}';
+$OLD_SITE_URL = '${e(params.oldSiteUrl)}';
+$HOME_DIR     = '/home/${e(params.targetUser)}/';
+$LOCAL_ZIP    = $HOME_DIR . 'whm_dl_' . substr(md5($AGENT_TOKEN), 0, 8) . '.zip';
+$DL_CHUNK     = 5 * 1024 * 1024; // 5 MB per download chunk
 
 header('Content-Type: application/json');
 
-if (!isset($_GET['token']) || $_GET['token'] !== AGENT_TOKEN) {
+if (!isset($_GET['token']) || $_GET['token'] !== $AGENT_TOKEN) {
     http_response_code(403);
     echo json_encode(['error' => 'Forbidden']);
     exit;
@@ -584,28 +594,40 @@ $action = $_GET['action'] ?? 'download_init';
 // ?action=cleanup
 // ════════════════════════════════════════════════════════════
 if ($action === 'cleanup') {
-    @unlink(LOCAL_ZIP);
-    // Signal packer to delete its ZIP + status files
-    $cu = PACKER_URL . '?action=cleanup&token=' . urlencode(PACKER_TOKEN);
-    @file_get_contents($cu);
+    @unlink($LOCAL_ZIP);
+    // Signal packer to delete its ZIP + status files (best-effort via cURL)
+    $ch2 = curl_init($PACKER_URL . '?action=cleanup&token=' . urlencode($PACKER_TOKEN));
+    curl_setopt_array($ch2, [CURLOPT_RETURNTRANSFER => true, CURLOPT_SSL_VERIFYPEER => false, CURLOPT_TIMEOUT => 10]);
+    @curl_exec($ch2); curl_close($ch2);
     @unlink(__FILE__);
     echo json_encode(['success' => true, 'action' => 'cleanup']);
     exit;
 }
 
 // ════════════════════════════════════════════════════════════
-// ?action=download_init — get ZIP total size, create local file
+// ?action=download_init — get ZIP total size via cURL, create local file
 // ════════════════════════════════════════════════════════════
 if ($action === 'download_init') {
-    @unlink(LOCAL_ZIP);
-    file_put_contents(LOCAL_ZIP, ''); // create/reset
+    @unlink($LOCAL_ZIP);
+    file_put_contents($LOCAL_ZIP, ''); // create/reset
 
-    $sizeUrl = PACKER_URL . '?action=download_size&token=' . urlencode(PACKER_TOKEN);
-    $ctx = stream_context_create(['ssl' => ['verify_peer' => false, 'verify_peer_name' => false]]);
-    $resp = @file_get_contents($sizeUrl, false, $ctx);
-    $data = $resp ? @json_decode($resp, true) : null;
+    $sizeUrl = $PACKER_URL . '?action=download_size&token=' . urlencode($PACKER_TOKEN);
+    $ch = curl_init($sizeUrl);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_TIMEOUT        => 15,
+    ]);
+    $resp = curl_exec($ch);
+    $curlErr  = curl_error($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    $data = ($resp && !$curlErr) ? @json_decode($resp, true) : null;
     if (!$data || empty($data['size'])) {
-        echo json_encode(['error' => 'Cannot get ZIP size from packer: ' . substr((string)$resp, 0, 200)]);
+        echo json_encode(['error' => 'Cannot get ZIP size (HTTP ' . $httpCode . ', curl: ' . $curlErr . '): ' . substr((string)$resp, 0, 200)]);
         exit;
     }
     echo json_encode(['total_size' => (int)$data['size'], 'downloaded' => 0]);
@@ -619,17 +641,17 @@ if ($action === 'download_chunk') {
     $downloaded = (int)($_GET['downloaded'] ?? 0);
     $totalSize  = (int)($_GET['total']      ?? 0);
     // Allow packer URL override (packer may have been redeployed by TS orchestrator)
-    $dlBase     = !empty($_GET['packer_url']) ? $_GET['packer_url'] : PACKER_URL;
+    $dlBase     = !empty($_GET['packer_url']) ? $_GET['packer_url'] : $PACKER_URL;
 
     if ($downloaded >= $totalSize) {
         echo json_encode(['downloaded' => $downloaded, 'total' => $totalSize, 'done' => true]);
         exit;
     }
 
-    $rangeEnd = min($downloaded + DL_CHUNK - 1, $totalSize - 1);
-    $dlUrl = $dlBase . '?action=download&token=' . urlencode(PACKER_TOKEN);
+    $rangeEnd = min($downloaded + $DL_CHUNK - 1, $totalSize - 1);
+    $dlUrl = $dlBase . '?action=download&token=' . urlencode($PACKER_TOKEN);
 
-    $fp = fopen(LOCAL_ZIP, 'ab');
+    $fp = fopen($LOCAL_ZIP, 'ab');
     $ch = curl_init($dlUrl);
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => false,
@@ -653,7 +675,7 @@ if ($action === 'download_chunk') {
         exit;
     }
 
-    $newDl = file_exists(LOCAL_ZIP) ? filesize(LOCAL_ZIP) : 0;
+    $newDl = file_exists($LOCAL_ZIP) ? filesize($LOCAL_ZIP) : 0;
     echo json_encode(['downloaded' => $newDl, 'total' => $totalSize, 'done' => ($newDl >= $totalSize)]);
     exit;
 }
@@ -664,12 +686,12 @@ if ($action === 'download_chunk') {
 if ($action === 'extract_batch') {
     $start = (int)($_GET['start'] ?? 0);
 
-    if (!file_exists(LOCAL_ZIP)) {
+    if (!file_exists($LOCAL_ZIP)) {
         echo json_encode(['error' => 'Local ZIP not found — download first']);
         exit;
     }
     $zip = new ZipArchive();
-    if ($zip->open(LOCAL_ZIP) !== true) {
+    if ($zip->open($LOCAL_ZIP) !== true) {
         echo json_encode(['error' => 'Cannot open downloaded ZIP']);
         exit;
     }
@@ -687,11 +709,11 @@ if ($action === 'extract_batch') {
 
         // Directory entry
         if (substr($name, -1) === '/') {
-            @mkdir(DEST_PATH . '/' . $name, 0755, true);
+            @mkdir($DEST_PATH . '/' . $name, 0755, true);
             continue;
         }
 
-        $dst = DEST_PATH . '/' . $name;
+        $dst = $DEST_PATH . '/' . $name;
         @mkdir(dirname($dst), 0755, true);
         $content = $zip->getFromIndex($i);
         if ($content !== false) {
@@ -702,7 +724,7 @@ if ($action === 'extract_batch') {
 
     $zip->close();
     $done = ($i >= $total);
-    if ($done) @unlink(LOCAL_ZIP);
+    if ($done) @unlink($LOCAL_ZIP);
 
     echo json_encode(['extracted' => $i, 'total' => $total, 'done' => $done]);
     exit;
@@ -712,16 +734,16 @@ if ($action === 'extract_batch') {
 // ?action=import_sql — exec mysql import
 // ════════════════════════════════════════════════════════════
 if ($action === 'import_sql') {
-    $sqlPath = DEST_PATH . '/_whm_export.sql';
+    $sqlPath = $DEST_PATH . '/_whm_export.sql';
     if (!file_exists($sqlPath)) {
         echo json_encode(['error' => 'SQL dump not found: ' . $sqlPath]);
         exit;
     }
     $cmd = sprintf('mysql -h %s -u %s -p%s %s < %s 2>&1',
         escapeshellarg('localhost'),
-        escapeshellarg(NEW_DB_USER),
-        escapeshellarg(NEW_DB_PASS),
-        escapeshellarg(NEW_DB_NAME),
+        escapeshellarg($NEW_DB_USER),
+        escapeshellarg($NEW_DB_PASS),
+        escapeshellarg($NEW_DB_NAME),
         escapeshellarg($sqlPath));
     exec($cmd, $out, $code);
     @unlink($sqlPath);
@@ -739,51 +761,51 @@ if ($action === 'import_sql') {
 if ($action === 'patch_config') {
     $tablePrefix = 'wp_';
 
-    if (APP_TYPE === 'wordpress') {
-        $cf = DEST_PATH . '/wp-config.php';
+    if ($APP_TYPE === 'wordpress') {
+        $cf = $DEST_PATH . '/wp-config.php';
         if (file_exists($cf)) {
             $c = file_get_contents($cf);
             if (preg_match('/\\$table_prefix\\s*=\\s*\'([^\']+)\'/', $c, $m)) $tablePrefix = $m[1];
-            $c = preg_replace("/define\\s*\\(\\s*'DB_NAME'\\s*,\\s*'[^']*'/",     "define('DB_NAME', '"     . addslashes(NEW_DB_NAME) . "'", $c);
-            $c = preg_replace("/define\\s*\\(\\s*'DB_USER'\\s*,\\s*'[^']*'/",     "define('DB_USER', '"     . addslashes(NEW_DB_USER) . "'", $c);
-            $c = preg_replace("/define\\s*\\(\\s*'DB_PASSWORD'\\s*,\\s*'[^']*'/", "define('DB_PASSWORD', '" . addslashes(NEW_DB_PASS) . "'", $c);
-            $c = preg_replace("/define\\s*\\(\\s*'DB_HOST'\\s*,\\s*'[^']*'/",     "define('DB_HOST', 'localhost'",                            $c);
+            $c = preg_replace("/define\\s*\\(\\s*'DB_NAME'\\s*,\\s*'[^']*'/",     "define('DB_NAME', '"     . addslashes($NEW_DB_NAME) . "'", $c);
+            $c = preg_replace("/define\\s*\\(\\s*'DB_USER'\\s*,\\s*'[^']*'/",     "define('DB_USER', '"     . addslashes($NEW_DB_USER) . "'", $c);
+            $c = preg_replace("/define\\s*\\(\\s*'DB_PASSWORD'\\s*,\\s*'[^']*'/", "define('DB_PASSWORD', '" . addslashes($NEW_DB_PASS) . "'", $c);
+            $c = preg_replace("/define\\s*\\(\\s*'DB_HOST'\\s*,\\s*'[^']*'/",     "define('DB_HOST', 'localhost'",                             $c);
             file_put_contents($cf, $c);
         }
         try {
-            $pdo = new PDO('mysql:host=localhost;dbname=' . NEW_DB_NAME, NEW_DB_USER, NEW_DB_PASS);
-            $old = rtrim(OLD_SITE_URL, '/');
-            $new = rtrim(NEW_SITE_URL, '/');
-            $pdo->exec("UPDATE {$tablePrefix}options SET option_value = REPLACE(option_value, " . $pdo->quote($old) . ", " . $pdo->quote($new) . ") WHERE option_name IN ('siteurl','home')");
-            $pdo->exec("UPDATE {$tablePrefix}posts SET guid = REPLACE(guid, "         . $pdo->quote($old) . ", " . $pdo->quote($new) . ")");
-            $pdo->exec("UPDATE {$tablePrefix}posts SET post_content = REPLACE(post_content, " . $pdo->quote($old) . ", " . $pdo->quote($new) . ")");
-            $pdo->exec("UPDATE {$tablePrefix}postmeta SET meta_value = REPLACE(meta_value, " . $pdo->quote($old) . ", " . $pdo->quote($new) . ")");
+            $pdo = new PDO('mysql:host=localhost;dbname=' . $NEW_DB_NAME, $NEW_DB_USER, $NEW_DB_PASS);
+            $oldUrl = rtrim($OLD_SITE_URL, '/');
+            $newUrl = rtrim($NEW_SITE_URL, '/');
+            $pdo->exec('UPDATE ' . $tablePrefix . 'options SET option_value = REPLACE(option_value, ' . $pdo->quote($oldUrl) . ', ' . $pdo->quote($newUrl) . ") WHERE option_name IN ('siteurl','home')");
+            $pdo->exec('UPDATE ' . $tablePrefix . 'posts SET guid = REPLACE(guid, '              . $pdo->quote($oldUrl) . ', ' . $pdo->quote($newUrl) . ')');
+            $pdo->exec('UPDATE ' . $tablePrefix . 'posts SET post_content = REPLACE(post_content, ' . $pdo->quote($oldUrl) . ', ' . $pdo->quote($newUrl) . ')');
+            $pdo->exec('UPDATE ' . $tablePrefix . 'postmeta SET meta_value = REPLACE(meta_value, '  . $pdo->quote($oldUrl) . ', ' . $pdo->quote($newUrl) . ')');
         } catch (Exception $ex) {
             echo json_encode(['error' => 'DB patch failed: ' . $ex->getMessage()]);
             exit;
         }
-    } elseif (APP_TYPE === 'prestashop') {
-        foreach ([DEST_PATH . '/app/config/parameters.php'] as $pf) {
+    } elseif ($APP_TYPE === 'prestashop') {
+        foreach ([$DEST_PATH . '/app/config/parameters.php'] as $pf) {
             if (!file_exists($pf)) continue;
             $c = file_get_contents($pf);
-            $c = preg_replace("/'database_name'\\s*=>\\s*'[^']*'/",     "'database_name' => '"     . addslashes(NEW_DB_NAME) . "'", $c);
-            $c = preg_replace("/'database_user'\\s*=>\\s*'[^']*'/",     "'database_user' => '"     . addslashes(NEW_DB_USER) . "'", $c);
-            $c = preg_replace("/'database_password'\\s*=>\\s*'[^']*'/", "'database_password' => '" . addslashes(NEW_DB_PASS) . "'", $c);
-            $c = preg_replace("/'database_host'\\s*=>\\s*'[^']*'/",     "'database_host' => 'localhost'",                           $c);
+            $c = preg_replace("/'database_name'\\s*=>\\s*'[^']*'/",     "'database_name' => '"     . addslashes($NEW_DB_NAME) . "'", $c);
+            $c = preg_replace("/'database_user'\\s*=>\\s*'[^']*'/",     "'database_user' => '"     . addslashes($NEW_DB_USER) . "'", $c);
+            $c = preg_replace("/'database_password'\\s*=>\\s*'[^']*'/", "'database_password' => '" . addslashes($NEW_DB_PASS) . "'", $c);
+            $c = preg_replace("/'database_host'\\s*=>\\s*'[^']*'/",     "'database_host' => 'localhost'",                            $c);
             file_put_contents($pf, $c);
         }
         try {
-            $pdo = new PDO('mysql:host=localhost;dbname=' . NEW_DB_NAME, NEW_DB_USER, NEW_DB_PASS);
-            $parsed = parse_url(NEW_SITE_URL);
+            $pdo = new PDO('mysql:host=localhost;dbname=' . $NEW_DB_NAME, $NEW_DB_USER, $NEW_DB_PASS);
+            $parsed = parse_url($NEW_SITE_URL);
             $newDomain = $parsed['host'] ?? '';
             if ($newDomain) {
-                $pdo->exec("UPDATE ps_configuration SET value = " . $pdo->quote($newDomain) . " WHERE name IN ('PS_SHOP_DOMAIN','PS_SHOP_DOMAIN_SSL')");
-                $pdo->exec("UPDATE ps_shop_url SET domain = " . $pdo->quote($newDomain) . ", domain_ssl = " . $pdo->quote($newDomain));
+                $pdo->exec('UPDATE ps_configuration SET value = ' . $pdo->quote($newDomain) . " WHERE name IN ('PS_SHOP_DOMAIN','PS_SHOP_DOMAIN_SSL')");
+                $pdo->exec('UPDATE ps_shop_url SET domain = ' . $pdo->quote($newDomain) . ', domain_ssl = ' . $pdo->quote($newDomain));
             }
-        } catch (Exception $ex) { /* non-fatal */ }
+        } catch (Exception $ex2) { /* non-fatal */ }
     }
 
-    echo json_encode(['success' => true, 'targetUrl' => NEW_SITE_URL]);
+    echo json_encode(['success' => true, 'targetUrl' => $NEW_SITE_URL]);
     exit;
 }
 
