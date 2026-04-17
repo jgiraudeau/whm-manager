@@ -57,7 +57,13 @@ function sanitizeStore(raw: unknown): MigrationStore {
 async function readStore(): Promise<MigrationStore> {
   try {
     const raw = await fs.readFile(getStorePath(), "utf8");
-    return sanitizeStore(JSON.parse(raw) as unknown);
+    try {
+      return sanitizeStore(JSON.parse(raw) as unknown);
+    } catch {
+      // JSON corrupted (e.g. concurrent write race) — reset rather than crash
+      console.error("[migration-store] JSON parse error, resetting store");
+      return { version: 1, jobs: [] };
+    }
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
       return { version: 1, jobs: [] };
@@ -66,10 +72,22 @@ async function readStore(): Promise<MigrationStore> {
   }
 }
 
+// Module-level write lock — serialises concurrent writeStore calls so concurrent
+// appendMigrationLog calls from the same process never interleave their file writes.
+let writeLock: Promise<void> = Promise.resolve();
+
 async function writeStore(store: MigrationStore): Promise<void> {
-  const filePath = getStorePath();
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(filePath, `${JSON.stringify(store, null, 2)}\n`, "utf8");
+  const doWrite = async () => {
+    const filePath = getStorePath();
+    const tmpPath = `${filePath}.tmp`;
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    // Write to .tmp then rename — atomic on POSIX, prevents partial-read corruption
+    await fs.writeFile(tmpPath, `${JSON.stringify(store, null, 2)}\n`, "utf8");
+    await fs.rename(tmpPath, filePath);
+  };
+  // Chain onto the existing lock so writes are serialised
+  writeLock = writeLock.then(doWrite, doWrite);
+  return writeLock;
 }
 
 function randomId(): string {

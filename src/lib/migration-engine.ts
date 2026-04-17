@@ -946,7 +946,7 @@ export async function callPackerPack(
 
     // Log progress only when offset changes (avoid spamming)
     if (offset !== lastOffset && onProgress) {
-      onProgress(`Compression ${offset}/${total} fichiers…`);
+      await onProgress(`Compression ${offset}/${total} fichiers…`);
       lastOffset = offset;
     }
 
