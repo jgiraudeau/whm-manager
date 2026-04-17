@@ -552,16 +552,22 @@ function buildUnpackerPhp(params: {
 }): string {
   const e = (s: string) => s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   return `<?php
+// Ping probe — no token required, used by TS deployer to verify PHP execution
+if (isset($_GET['action']) && $_GET['action'] === 'ping') {
+    header('Content-Type: application/json');
+    echo json_encode(['ping' => 'ok', 'php' => PHP_VERSION]);
+    exit;
+}
 error_reporting(0);
 set_time_limit(30);
 ini_set('memory_limit', '512M');
 
-// Capture PHP fatal errors (incl. out-of-memory, exec failures) as JSON
+// Capture PHP fatal errors as JSON (runtime fatal errors, NOT parse errors)
 register_shutdown_function(function() {
-    $e = error_get_last();
-    if ($e && in_array($e['type'], [E_ERROR, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
+    $err = error_get_last();
+    if ($err && in_array($err['type'], [E_ERROR, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
         if (!headers_sent()) { header('Content-Type: application/json'); }
-        echo json_encode(['fatal' => $e['message'], 'file' => basename($e['file']), 'line' => $e['line']]);
+        echo json_encode(['fatal' => $err['message'], 'file' => basename($err['file']), 'line' => $err['line']]);
     }
 });
 
@@ -618,7 +624,7 @@ if ($action === 'download_init') {
         CURLOPT_SSL_VERIFYPEER => false,
         CURLOPT_SSL_VERIFYHOST => false,
         CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_TIMEOUT        => 15,
+        CURLOPT_TIMEOUT        => 8,  // keep well under PHP-FPM request_terminate_timeout (~15s)
     ]);
     $resp = curl_exec($ch);
     $curlErr  = curl_error($ch);
@@ -1037,6 +1043,25 @@ export async function deployUnpackerAgent(params: {
 
   await uploadFileToCpanel(params.targetUser, mainPublicHtml, fileName, content);
 
+  // Verify PHP is executing at this URL — call the ping probe (no token required).
+  // An empty response means a PHP parse error (parse errors prevent any output).
+  await sleep(500); // small delay to let NFS propagate
+  const pingUrl = `${params.unpackerBaseUrl}/${fileName}?action=ping`;
+  let pingText = "";
+  let pingStatus = 0;
+  try {
+    const pingRes = await fetchWithTimeout(pingUrl, {}, 10_000);
+    pingText = await pingRes.text();
+    pingStatus = pingRes.status;
+  } catch (err) {
+    throw new Error(`Unpacker ping failed (network): ${String(err)}`);
+  }
+  if (!pingText.includes('"ping"')) {
+    throw new Error(
+      `Unpacker PHP ne répond pas (HTTP ${pingStatus}, body: [${pingText.slice(0, 200)}]) — URL: ${pingUrl}`,
+    );
+  }
+
   return { unpackerFileName: fileName, unpackerToken: token };
 }
 
@@ -1063,11 +1088,11 @@ export async function callUnpackerUnpack(
     const res = await fetchWithTimeout(`${unpackerUrl}?token=${tp}&action=${action}${extra}`, {}, 60_000);
     const text = await res.text();
     if (text.trimStart().startsWith("<")) {
-      throw new Error(`Unpacker returned HTML (HTTP ${res.status}) for action=${action} — ${text.slice(0, 200)}`);
+      throw new Error(`Unpacker HTML HTTP${res.status} action=${action} — ${text.slice(0, 200)}`);
     }
     let j: Record<string, unknown>;
     try { j = JSON.parse(text) as Record<string, unknown>; }
-    catch { throw new Error(`Unpacker non-JSON for action=${action}: ${text.slice(0, 200)}`); }
+    catch { throw new Error(`Unpacker non-JSON HTTP${res.status} action=${action}: [${text.slice(0, 300)}]`); }
     return j;
   }
 
@@ -1273,6 +1298,7 @@ export async function runMigrationForTarget(params: RunMigrationTargetParams): P
     // 5. Drive chunked unpacker: download → extract → import SQL → patch → cleanup
     // Unpacker is at main domain root, not subdomain path
     const unpackerPublicUrl = `${unpackerBaseUrl}/${unpackerFileName}`;
+    await log(jobId, targetUser, `URL unpacker : ${unpackerPublicUrl}`);
     const { targetUrl } = await callUnpackerUnpack(
       unpackerPublicUrl,
       unpackerToken,
